@@ -38,7 +38,7 @@ reminders = ICloudReminders(
 tasks_store = TaskStore(board_config.db_path)
 
 # R-COST: см. shared/rate_limiter.py — не более N вопросов ассистенту в час
-# на чат, чтобы один болтливый чат не сжёг весь бюджет OpenRouter.
+# на чат, чтобы один болтливый чат не сжёг весь бюджет LLM.
 _rate_limiter = SlidingWindowLimiter(max_calls=config.max_questions_per_hour, window_seconds=3600)
 
 # R-COST: контекст проекта (Docs/*.md обоих репо) — не на каждый вопрос, а
@@ -217,10 +217,10 @@ async def reminder_loop() -> None:
 
 def _ask_llm(chat_id: int, question: str, *, force_context: bool = False) -> str:
     if not llm.config.api_key:
-        # OPENROUTER_API_KEY не обязателен для старта бота (задачи/доска не
+        # OPENAI_API_KEY не обязателен для старта бота (задачи/доска не
         # используют LLM), но без него ассистент отвечать не может — явная
         # ошибка пользователю лучше молчания.
-        raise RuntimeError("Ассистент ещё не настроен: не задан OPENROUTER_API_KEY.")
+        raise RuntimeError("Ассистент ещё не настроен: не задан OPENAI_API_KEY.")
     # R-COST: контекст грузим, только если он реально нужен — иначе на
     # "привет"/"спасибо" улетал бы тот же объём токенов, что на серьёзный
     # архитектурный вопрос. /ask — явное намерение спросить, форсируем контекст.
@@ -244,7 +244,7 @@ def _ask_llm(chat_id: int, question: str, *, force_context: bool = False) -> str
 
 
 def _assistant_error_message(exc: Exception) -> str:
-    # Наши собственные сообщения (например, "не настроен OPENROUTER_API_KEY")
+    # Наши собственные сообщения (например, "не настроен OPENAI_API_KEY")
     # безопасно показать как есть. Остальное — сеть/провайдер/неожиданное —
     # логируем полностью, но в чат не тащим детали (могут содержать служебную
     # информацию о запросе), чтобы не палить внутренности бота в общем чате.

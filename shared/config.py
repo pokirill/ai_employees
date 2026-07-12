@@ -45,7 +45,7 @@ class TeamBotConfig:
 
     # R-COST: команд-бот — низкие ставки (внутренний Q&A), можно посадить на
     # более дешёвую/быструю модель, не трогая ту, что настроена для канала.
-    # Пусто → берётся общий OPENROUTER_MODEL.
+    # Пусто → берётся общий OPENAI_MODEL.
     model_override: str = field(default_factory=lambda: _optional("TEAM_BOT_MODEL"))
     # R-COST: не более N вопросов ассистенту в час НА ЧАТ — страховка от
     # случайного/нарочного вычерпывания бюджета в бытовом чате. 0 = выключено.
@@ -92,11 +92,15 @@ class TaskBoardConfig:
 
 @dataclass(frozen=True)
 class LLMConfig:
-    # OpenRouter — OpenAI-совместимый API, но другой base_url и модели с
-    # префиксом провайдера (например "openai/gpt-5-mini", "anthropic/claude-...").
-    # Не обязателен для старта бота — команды /task, /tasks, /done, /board не
-    # используют LLM вообще; отсутствие ключа падает только при реальной
-    # попытке спросить ассистента (см. team_bot/main.py _ask_llm).
-    api_key: str = field(default_factory=lambda: _optional("OPENROUTER_API_KEY"))
-    model: str = field(default_factory=lambda: _optional("OPENROUTER_MODEL", "openai/gpt-5-mini"))
-    base_url: str = field(default_factory=lambda: _optional("OPENROUTER_BASE_URL", "https://openrouter.ai/api/v1"))
+    # Прямой OpenAI (не OpenRouter — решили остаться на уже рабочем ключе
+    # OpenAI, не заводить отдельный ключ на OpenRouter). Не обязателен для
+    # старта бота — команды /task, /tasks, /done, /board не используют LLM
+    # вообще; отсутствие ключа падает только при реальной попытке спросить
+    # ассистента (см. team_bot/main.py _ask_llm).
+    api_key: str = field(default_factory=lambda: _optional("OPENAI_API_KEY"))
+    model: str = field(default_factory=lambda: _optional("OPENAI_MODEL", "gpt-5-mini"))
+    # Дефолт задан явно, а не пусто: если .env содержит "OPENAI_BASE_URL="
+    # (пустая строка), openai SDK читает её напрямую из окружения как есть и
+    # НЕ подставляет свой дефолт — пустая строка ломает запросы (httpx:
+    # "missing http:// protocol"). Настраиваемо на случай прокси/шлюза.
+    base_url: str = field(default_factory=lambda: _optional("OPENAI_BASE_URL", "https://api.openai.com/v1"))
