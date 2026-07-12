@@ -42,5 +42,8 @@ class ChannelBotConfig:
 
 @dataclass(frozen=True)
 class LLMConfig:
-    api_key: str = field(default_factory=lambda: _require("OPENAI_API_KEY"))
-    model: str = field(default_factory=lambda: _optional("OPENAI_MODEL", "gpt-5-mini"))
+    # OpenRouter — OpenAI-совместимый API, но другой base_url и модели с
+    # префиксом провайдера (например "openai/gpt-5-mini", "anthropic/claude-...").
+    api_key: str = field(default_factory=lambda: _require("OPENROUTER_API_KEY"))
+    model: str = field(default_factory=lambda: _optional("OPENROUTER_MODEL", "openai/gpt-5-mini"))
+    base_url: str = field(default_factory=lambda: _optional("OPENROUTER_BASE_URL", "https://openrouter.ai/api/v1"))
