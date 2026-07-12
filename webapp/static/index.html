@@ -2,76 +2,412 @@
 <html lang="ru">
 <head>
 <meta charset="utf-8" />
-<meta name="viewport" content="width=device-width, initial-scale=1" />
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
 <title>Кубышка — доска задач</title>
+<link rel="preconnect" href="https://fonts.googleapis.com" />
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+<link href="https://fonts.googleapis.com/css2?family=Manrope:wght@600;700;800&display=swap" rel="stylesheet" />
 <script src="https://telegram.org/js/telegram-web-app.js"></script>
 <style>
   :root {
-    --bg: #ffffff;
-    --text: #111111;
-    --hint: #707579;
-    --link: #2481cc;
-    --button: #2481cc;
-    --button-text: #ffffff;
-    --card: #f4f4f5;
+    --font-display: "Manrope", system-ui, sans-serif;
+    --font-body: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+    --font-mono: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+
+    --bg: #f5f7f3;
+    --surface: #ffffff;
+    --surface-2: #edf1eb;
+    --text: #16241d;
+    --text-muted: #5b6b62;
+    --accent: #1f6f5c;
+    --accent-contrast: #ffffff;
+    --accent-soft: #dcebe5;
+    --border: #dce3dd;
+    --claimed: #c97c2a;
+    --claimed-soft: #f5e3d0;
+    --testing: #3e6e8e;
+    --testing-soft: #dce9f0;
+    --done: #8a9690;
+    --done-soft: #e9ece8;
+    --danger: #b5432f;
+    --shadow: 0 1px 2px rgba(22, 36, 29, 0.06), 0 6px 16px rgba(22, 36, 29, 0.06);
   }
+
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #0f1613;
+      --surface: #172019;
+      --surface-2: #1c2620;
+      --text: #e7efea;
+      --text-muted: #93a69c;
+      --accent: #4fbf9f;
+      --accent-contrast: #08130f;
+      --accent-soft: #1e3a31;
+      --border: #24322b;
+      --claimed: #e0a458;
+      --claimed-soft: #3a2c18;
+      --testing: #6fb0d6;
+      --testing-soft: #1c2e38;
+      --done: #6b7a72;
+      --done-soft: #1b2420;
+      --danger: #d97a67;
+      --shadow: 0 1px 2px rgba(0, 0, 0, 0.35), 0 8px 20px rgba(0, 0, 0, 0.3);
+    }
+  }
+  :root[data-theme="dark"] {
+    --bg: #0f1613;
+    --surface: #172019;
+    --surface-2: #1c2620;
+    --text: #e7efea;
+    --text-muted: #93a69c;
+    --accent: #4fbf9f;
+    --accent-contrast: #08130f;
+    --accent-soft: #1e3a31;
+    --border: #24322b;
+    --claimed: #e0a458;
+    --claimed-soft: #3a2c18;
+    --testing: #6fb0d6;
+    --testing-soft: #1c2e38;
+    --done: #6b7a72;
+    --done-soft: #1b2420;
+    --danger: #d97a67;
+    --shadow: 0 1px 2px rgba(0, 0, 0, 0.35), 0 8px 20px rgba(0, 0, 0, 0.3);
+  }
+  :root[data-theme="light"] {
+    --bg: #f5f7f3;
+    --surface: #ffffff;
+    --surface-2: #edf1eb;
+    --text: #16241d;
+    --text-muted: #5b6b62;
+    --accent: #1f6f5c;
+    --accent-contrast: #ffffff;
+    --accent-soft: #dcebe5;
+    --border: #dce3dd;
+    --claimed: #c97c2a;
+    --claimed-soft: #f5e3d0;
+    --testing: #3e6e8e;
+    --testing-soft: #dce9f0;
+    --done: #8a9690;
+    --done-soft: #e9ece8;
+    --danger: #b5432f;
+    --shadow: 0 1px 2px rgba(22, 36, 29, 0.06), 0 6px 16px rgba(22, 36, 29, 0.06);
+  }
+
   * { box-sizing: border-box; }
+  html, body { height: 100%; }
   body {
     margin: 0;
-    padding: 12px;
-    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+    font-family: var(--font-body);
     background: var(--bg);
     color: var(--text);
+    -webkit-tap-highlight-color: transparent;
   }
-  h1 { font-size: 18px; margin: 4px 0 12px; }
-  .new-task { display: flex; gap: 6px; margin-bottom: 14px; }
-  .new-task input {
-    flex: 1; padding: 8px 10px; border-radius: 8px; border: 1px solid var(--hint);
-    background: var(--card); color: var(--text); font-size: 14px;
+  .app {
+    max-width: 640px;
+    margin: 0 auto;
+    padding: 14px 14px calc(88px + env(safe-area-inset-bottom)) 14px;
   }
-  button {
-    border: none; border-radius: 8px; padding: 8px 12px; font-size: 13px;
-    background: var(--button); color: var(--button-text); cursor: pointer;
+
+  header.board-head {
+    position: sticky;
+    top: 0;
+    z-index: 5;
+    background: var(--bg);
+    padding: 6px 0 12px;
   }
-  button.secondary { background: var(--card); color: var(--text); }
-  button:disabled { opacity: 0.5; cursor: default; }
+  h1 {
+    font-family: var(--font-display);
+    font-weight: 800;
+    font-size: 19px;
+    letter-spacing: -0.01em;
+    margin: 2px 0 10px;
+    text-wrap: balance;
+  }
+  .tally {
+    display: flex;
+    gap: 14px;
+    font-family: var(--font-mono);
+    font-variant-numeric: tabular-nums;
+    font-size: 13px;
+    color: var(--text-muted);
+    border-top: 1px solid var(--border);
+    border-bottom: 1px solid var(--border);
+    padding: 8px 2px;
+  }
+  .tally b { color: var(--text); font-weight: 600; }
+  .tally .dot { display: inline-block; width: 6px; height: 6px; border-radius: 50%; margin-right: 5px; vertical-align: middle; }
+  .dot-open { background: var(--accent); }
+  .dot-testing { background: var(--testing); }
+  .dot-done { background: var(--done); }
+
+  ul.task-list { list-style: none; margin: 12px 0 0; padding: 0; display: flex; flex-direction: column; gap: 8px; }
+
   .task {
-    background: var(--card); border-radius: 10px; padding: 10px 12px; margin-bottom: 10px;
+    position: relative;
+    display: flex;
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    box-shadow: var(--shadow);
+    overflow: hidden;
   }
-  .task.done { opacity: 0.6; }
-  .task-title { font-size: 15px; font-weight: 600; margin-bottom: 4px; }
-  .task-title.done { text-decoration: line-through; }
-  .task-meta { font-size: 12px; color: var(--hint); margin-bottom: 8px; }
-  .task-actions { display: flex; gap: 6px; flex-wrap: wrap; margin-bottom: 6px; }
-  .comments { margin-top: 6px; }
-  .comment { font-size: 12px; color: var(--text); margin-bottom: 3px; }
-  .comment b { color: var(--hint); font-weight: 500; }
-  .comment-row { display: flex; gap: 6px; margin-top: 6px; }
+  .task .stripe { width: 4px; flex: 0 0 4px; background: var(--accent); }
+  .task[data-status="testing"] .stripe { background: var(--testing); }
+  .task[data-status="done"] .stripe { background: var(--done); }
+  .task[data-status="done"] { opacity: 0.72; }
+
+  .task-body { flex: 1; min-width: 0; padding: 10px 12px 11px; }
+  .task-summary { cursor: pointer; }
+  .task-summary:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; border-radius: 6px; }
+  .task-head { display: flex; align-items: baseline; gap: 8px; }
+  .task-no {
+    font-family: var(--font-mono);
+    font-variant-numeric: tabular-nums;
+    font-size: 12px;
+    color: var(--text-muted);
+    flex: none;
+  }
+  .task-title {
+    font-family: var(--font-display);
+    font-weight: 700;
+    font-size: 15px;
+    line-height: 1.3;
+    margin: 0;
+    text-wrap: balance;
+  }
+  .task[data-status="done"] .task-title { text-decoration: line-through; text-decoration-color: var(--done); }
+
+  .task-meta {
+    margin-top: 3px;
+    font-size: 12px;
+    color: var(--text-muted);
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    flex-wrap: wrap;
+  }
+  .chip {
+    display: inline-flex;
+    align-items: center;
+    font-size: 11px;
+    font-weight: 600;
+    padding: 2px 7px;
+    border-radius: 999px;
+    background: var(--claimed-soft);
+    color: var(--claimed);
+  }
+  .status-pill {
+    display: inline-flex;
+    align-items: center;
+    font-family: var(--font-display);
+    font-size: 12px;
+    font-weight: 700;
+    padding: 3px 10px;
+    border-radius: 999px;
+    background: var(--accent-soft);
+    color: var(--accent);
+    margin: 6px 0 2px;
+  }
+  .status-pill[data-status="testing"] { background: var(--testing-soft); color: var(--testing); }
+  .status-pill[data-status="done"] { background: var(--done-soft); color: var(--done); }
+
+  .task-actions { display: flex; gap: 6px; flex-wrap: wrap; margin-top: 8px; }
+  button {
+    font-family: var(--font-display);
+    border: none;
+    border-radius: 999px;
+    padding: 6px 12px;
+    font-size: 12.5px;
+    font-weight: 700;
+    cursor: pointer;
+    background: var(--accent);
+    color: var(--accent-contrast);
+    transition: transform 0.1s ease, opacity 0.1s ease;
+  }
+  button.ghost { background: var(--surface-2); color: var(--text); }
+  button:disabled { opacity: 0.5; cursor: default; }
+  button:active { transform: scale(0.96); }
+  button:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+
+  .comments { margin: 9px 0 0; padding: 8px 0 0; border-top: 1px dashed var(--border); display: flex; flex-direction: column; gap: 4px; }
+  .comment { font-size: 12.5px; line-height: 1.4; }
+  .comment .author { font-weight: 700; color: var(--text-muted); }
+
+  .comment-row { display: flex; gap: 6px; margin-top: 8px; }
   .comment-row input {
-    flex: 1; padding: 6px 8px; border-radius: 6px; border: 1px solid var(--hint);
-    background: var(--bg); color: var(--text); font-size: 12px;
+    flex: 1;
+    min-width: 0;
+    padding: 6px 9px;
+    border-radius: 7px;
+    border: 1px solid var(--border);
+    background: var(--surface-2);
+    color: var(--text);
+    font-family: var(--font-body);
+    font-size: 12.5px;
   }
-  .empty { color: var(--hint); font-size: 14px; text-align: center; margin-top: 40px; }
+  .comment-row input:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
+  .comment-row button { padding: 6px 11px; }
+
+  .empty-state {
+    text-align: center;
+    color: var(--text-muted);
+    font-size: 14px;
+    padding: 48px 12px;
+  }
+
+  footer.composer {
+    position: fixed;
+    left: 0; right: 0; bottom: 0;
+    padding: 10px 14px calc(10px + env(safe-area-inset-bottom));
+    background: var(--surface);
+    border-top: 1px solid var(--border);
+    display: flex;
+    gap: 8px;
+    max-width: 640px;
+    margin: 0 auto;
+  }
+  footer.composer input {
+    flex: 1;
+    min-width: 0;
+    padding: 10px 12px;
+    border-radius: 10px;
+    border: 1px solid var(--border);
+    background: var(--surface-2);
+    color: var(--text);
+    font-family: var(--font-body);
+    font-size: 14px;
+  }
+  footer.composer input:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
+  footer.composer button { padding: 10px 16px; font-size: 13.5px; }
+
+  .error-banner {
+    background: var(--danger);
+    color: #fff;
+    font-size: 12.5px;
+    padding: 7px 10px;
+    border-radius: 8px;
+    margin-bottom: 10px;
+    display: none;
+  }
+
+  /* Карточка задачи — полноэкранный оверлей поверх списка */
+  .card-overlay {
+    position: fixed;
+    inset: 0;
+    z-index: 20;
+    background: var(--bg);
+    display: flex;
+    flex-direction: column;
+    opacity: 0;
+    transform: translateY(8px);
+    transition: opacity 0.16s ease, transform 0.16s ease;
+    pointer-events: none;
+  }
+  .card-overlay.open { opacity: 1; transform: translateY(0); pointer-events: auto; }
+  .card-top {
+    position: sticky;
+    top: 0;
+    padding: 10px 14px;
+    background: var(--bg);
+    border-bottom: 1px solid var(--border);
+  }
+  .card-back { padding: 6px 12px; }
+  .card-scroll { flex: 1; overflow-y: auto; padding: 4px 16px calc(24px + env(safe-area-inset-bottom)); max-width: 640px; margin: 0 auto; width: 100%; }
+  .card-title { font-family: var(--font-display); font-weight: 800; font-size: 20px; margin: 6px 0 2px; text-wrap: balance; }
+  .card-section { margin-top: 18px; }
+  .card-section-label {
+    font-family: var(--font-display);
+    font-size: 11px;
+    font-weight: 700;
+    text-transform: uppercase;
+    letter-spacing: 0.06em;
+    color: var(--text-muted);
+    margin-bottom: 6px;
+  }
+  textarea#card-description {
+    width: 100%;
+    min-height: 72px;
+    resize: vertical;
+    padding: 9px 10px;
+    border-radius: 8px;
+    border: 1px solid var(--border);
+    background: var(--surface-2);
+    color: var(--text);
+    font-family: var(--font-body);
+    font-size: 13.5px;
+    line-height: 1.4;
+  }
+  textarea#card-description:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
+  #card-description-save { margin-top: 8px; }
+
+  @media (prefers-reduced-motion: reduce) {
+    * { transition: none !important; }
+  }
 </style>
 </head>
 <body>
-  <h1>Доска задач «Кубышка»</h1>
-  <div class="new-task">
+  <div class="app">
+    <header class="board-head">
+      <h1>Доска задач «Кубышка»</h1>
+      <div class="tally" id="tally"></div>
+      <div class="error-banner" id="error-banner"></div>
+    </header>
+
+    <ul class="task-list" id="tasks"></ul>
+    <div class="empty-state" id="empty" style="display:none">Задач пока нет — впиши первую внизу.</div>
+  </div>
+
+  <footer class="composer">
     <input id="new-task-input" type="text" placeholder="Новая задача…" />
     <button id="new-task-btn">Добавить</button>
+  </footer>
+
+  <div class="card-overlay" id="card-overlay">
+    <div class="card-top">
+      <button id="card-back" class="ghost card-back">← Назад</button>
+    </div>
+    <div class="card-scroll">
+      <span class="task-no" id="card-no"></span>
+      <h2 class="card-title" id="card-title"></h2>
+      <div class="status-pill" id="card-status-pill"></div>
+      <div class="task-meta" id="card-meta"></div>
+
+      <div class="task-actions" id="card-actions"></div>
+
+      <div class="card-section">
+        <div class="card-section-label">Описание</div>
+        <textarea id="card-description" placeholder="Добавь описание задачи…"></textarea>
+        <button id="card-description-save" class="ghost">Сохранить описание</button>
+      </div>
+
+      <div class="card-section">
+        <div class="card-section-label">Комментарии</div>
+        <div class="comments" id="card-comments"></div>
+        <div class="comment-row">
+          <input id="card-comment-input" type="text" placeholder="Комментарий…" />
+          <button id="card-comment-send" class="ghost">→</button>
+        </div>
+      </div>
+    </div>
   </div>
-  <div id="tasks"></div>
-  <div id="empty" class="empty" style="display:none">Задач пока нет 🎉</div>
 
 <script>
 const tg = window.Telegram && window.Telegram.WebApp;
-if (tg) { tg.ready(); tg.expand(); }
+if (tg) {
+  tg.ready();
+  tg.expand();
+  // Мини-апп работает внутри Telegram WebView — его тема (light/dark) не
+  // всегда совпадает с системной OS-темой устройства, поэтому синхронизируем
+  // явно через Telegram.WebApp.colorScheme, а не полагаемся только на
+  // prefers-color-scheme.
+  const applyTheme = () => { document.documentElement.dataset.theme = tg.colorScheme; };
+  applyTheme();
+  tg.onEvent("themeChanged", applyTheme);
+}
 
-// Мини-апп открывается только в контексте Telegram — initData подписана
-// на стороне клиента Telegram и проверяется сервером на каждый запрос
-// (см. shared/telegram_webapp_auth.py), так что без initData API просто
-// откажет с 401.
 const initData = tg ? tg.initData : "";
+let latestTasks = [];
+let openTaskId = null;
 
 async function api(path, body) {
   const res = await fetch(path, {
@@ -86,6 +422,13 @@ async function api(path, body) {
   return res.json();
 }
 
+function showError(message) {
+  const banner = document.getElementById("error-banner");
+  banner.textContent = message;
+  banner.style.display = "block";
+  setTimeout(() => { banner.style.display = "none"; }, 4000);
+}
+
 function fmtTime(iso) {
   try {
     return new Date(iso).toLocaleString("ru-RU", { day: "2-digit", month: "2-digit", hour: "2-digit", minute: "2-digit" });
@@ -94,81 +437,8 @@ function fmtTime(iso) {
   }
 }
 
-function renderTask(task) {
-  const el = document.createElement("div");
-  el.className = "task" + (task.status === "done" ? " done" : "");
-
-  const title = document.createElement("div");
-  title.className = "task-title" + (task.status === "done" ? " done" : "");
-  title.textContent = `#${task.id} ${task.title}`;
-  el.appendChild(title);
-
-  const meta = document.createElement("div");
-  meta.className = "task-meta";
-  const claimText = task.claimed_by ? ` · взял: ${task.claimed_by}` : "";
-  meta.textContent = `от ${task.created_by} · ${fmtTime(task.created_at)}${claimText}`;
-  el.appendChild(meta);
-
-  const actions = document.createElement("div");
-  actions.className = "task-actions";
-
-  if (task.status !== "done") {
-    if (task.claimed_by) {
-      actions.appendChild(makeButton("Отпустить", "secondary", () => act(`/api/tasks/${task.id}/unclaim`, {})));
-    } else {
-      actions.appendChild(makeButton("Взять себе", "", () => act(`/api/tasks/${task.id}/claim`, {})));
-    }
-    actions.appendChild(makeButton("Готово ✓", "", () => act(`/api/tasks/${task.id}/complete`, {})));
-  } else {
-    actions.appendChild(makeButton("Вернуть в работу", "secondary", () => act(`/api/tasks/${task.id}/reopen`, {})));
-  }
-  el.appendChild(actions);
-
-  if (task.comments.length) {
-    const comments = document.createElement("div");
-    comments.className = "comments";
-    task.comments.forEach((c) => {
-      const line = document.createElement("div");
-      line.className = "comment";
-      line.innerHTML = `<b>${escapeHtml(c.author)}:</b> ${escapeHtml(c.text)}`;
-      comments.appendChild(line);
-    });
-    el.appendChild(comments);
-  }
-
-  const commentRow = document.createElement("div");
-  commentRow.className = "comment-row";
-  const input = document.createElement("input");
-  input.type = "text";
-  input.placeholder = "Комментарий…";
-  const sendBtn = makeButton("→", "secondary", async () => {
-    const text = input.value.trim();
-    if (!text) return;
-    await act(`/api/tasks/${task.id}/comment`, { text });
-    input.value = "";
-  });
-  commentRow.appendChild(input);
-  commentRow.appendChild(sendBtn);
-  el.appendChild(commentRow);
-
-  return el;
-}
-
-function makeButton(label, cls, onClick) {
-  const btn = document.createElement("button");
-  btn.textContent = label;
-  if (cls) btn.className = cls;
-  btn.addEventListener("click", async () => {
-    btn.disabled = true;
-    try {
-      await onClick();
-    } catch (e) {
-      if (tg) tg.showAlert(e.message); else alert(e.message);
-    } finally {
-      btn.disabled = false;
-    }
-  });
-  return btn;
+function padId(id) {
+  return "№" + String(id).padStart(3, "0");
 }
 
 function escapeHtml(text) {
@@ -177,37 +447,269 @@ function escapeHtml(text) {
   return div.innerHTML;
 }
 
+function statusLabel(status) {
+  if (status === "testing") return "Тестируется";
+  if (status === "done") return "Готово";
+  return "Открыта";
+}
+
+function makeButton(label, cls, onClick) {
+  const btn = document.createElement("button");
+  btn.textContent = label;
+  if (cls) btn.className = cls;
+  btn.addEventListener("click", async (e) => {
+    e.stopPropagation();
+    btn.disabled = true;
+    try {
+      await onClick();
+    } catch (err) {
+      showError(err.message);
+      if (tg) tg.HapticFeedback && tg.HapticFeedback.notificationOccurred("error");
+    } finally {
+      btn.disabled = false;
+    }
+  });
+  return btn;
+}
+
 async function act(path, body) {
   await api(path, body);
+  if (tg) tg.HapticFeedback && tg.HapticFeedback.impactOccurred("light");
   await loadTasks();
+}
+
+// Общий набор кнопок действий — переиспользуется и в строке списка, и в
+// развёрнутой карточке, чтобы поведение (и набор доступных переходов) не
+// расходилось между двумя видами одной и той же задачи.
+function buildTaskActions(task) {
+  const wrap = document.createElement("div");
+  wrap.className = "task-actions";
+  if (task.status === "done") {
+    wrap.appendChild(makeButton("Вернуть в работу", "ghost", () => act(`/api/tasks/${task.id}/reopen`, {})));
+    return wrap;
+  }
+  if (task.claimed_by) {
+    wrap.appendChild(makeButton("Отпустить", "ghost", () => act(`/api/tasks/${task.id}/unclaim`, {})));
+  } else {
+    wrap.appendChild(makeButton("Взять себе", "", () => act(`/api/tasks/${task.id}/claim`, {})));
+  }
+  if (task.status !== "testing") {
+    wrap.appendChild(makeButton("На тестирование", "ghost", () => act(`/api/tasks/${task.id}/testing`, {})));
+  } else {
+    wrap.appendChild(makeButton("Вернуть в работу", "ghost", () => act(`/api/tasks/${task.id}/reopen`, {})));
+  }
+  wrap.appendChild(makeButton("Готово", "", () => act(`/api/tasks/${task.id}/complete`, {})));
+  return wrap;
+}
+
+function buildCommentRow(taskId, onSent) {
+  const row = document.createElement("div");
+  row.className = "comment-row";
+  const input = document.createElement("input");
+  input.type = "text";
+  input.placeholder = "Комментарий…";
+  input.addEventListener("click", (e) => e.stopPropagation());
+  row.appendChild(input);
+  row.appendChild(
+    makeButton("→", "ghost", async () => {
+      const text = input.value.trim();
+      if (!text) return;
+      await act(`/api/tasks/${taskId}/comment`, { text });
+      input.value = "";
+      if (onSent) onSent();
+    })
+  );
+  return row;
+}
+
+function renderComments(container, comments) {
+  container.innerHTML = "";
+  comments.forEach((c) => {
+    const line = document.createElement("div");
+    line.className = "comment";
+    line.innerHTML = `<span class="author">${escapeHtml(c.author)}:</span> ${escapeHtml(c.text)}`;
+    container.appendChild(line);
+  });
+}
+
+function renderTask(task) {
+  const status = task.status === "done" ? "done" : task.status === "testing" ? "testing" : "open";
+
+  const li = document.createElement("li");
+  li.className = "task";
+  li.dataset.status = status;
+
+  const stripe = document.createElement("div");
+  stripe.className = "stripe";
+  li.appendChild(stripe);
+
+  const body = document.createElement("div");
+  body.className = "task-body";
+
+  const summary = document.createElement("div");
+  summary.className = "task-summary";
+  summary.tabIndex = 0;
+  summary.setAttribute("role", "button");
+  summary.addEventListener("click", () => openCard(task.id));
+  summary.addEventListener("keydown", (e) => { if (e.key === "Enter") openCard(task.id); });
+
+  const head = document.createElement("div");
+  head.className = "task-head";
+  const no = document.createElement("span");
+  no.className = "task-no";
+  no.textContent = padId(task.id);
+  const title = document.createElement("h3");
+  title.className = "task-title";
+  title.textContent = task.title;
+  head.append(no, title);
+  summary.appendChild(head);
+
+  const meta = document.createElement("div");
+  meta.className = "task-meta";
+  const metaText = document.createElement("span");
+  metaText.textContent = `${task.created_by} · ${fmtTime(task.created_at)}`;
+  meta.appendChild(metaText);
+  if (task.claimed_by) {
+    const chip = document.createElement("span");
+    chip.className = "chip";
+    chip.textContent = task.claimed_by;
+    meta.appendChild(chip);
+  }
+  summary.appendChild(meta);
+  body.appendChild(summary);
+
+  body.appendChild(buildTaskActions(task));
+
+  if (task.comments.length) {
+    const comments = document.createElement("div");
+    comments.className = "comments";
+    renderComments(comments, task.comments);
+    body.appendChild(comments);
+  }
+  body.appendChild(buildCommentRow(task.id));
+
+  li.appendChild(body);
+  return li;
+}
+
+function renderTally(tasks) {
+  const open = tasks.filter((t) => t.status === "open").length;
+  const testing = tasks.filter((t) => t.status === "testing").length;
+  const done = tasks.filter((t) => t.status === "done").length;
+  const el = document.getElementById("tally");
+  el.innerHTML =
+    `<span><span class="dot dot-open"></span><b>${open}</b> открыто</span>` +
+    `<span><span class="dot dot-testing"></span><b>${testing}</b> на тестировании</span>` +
+    `<span><span class="dot dot-done"></span><b>${done}</b> готово</span>`;
 }
 
 async function loadTasks() {
   const tasks = await api("/api/tasks/list", {});
+  latestTasks = tasks;
+  renderTally(tasks);
   const container = document.getElementById("tasks");
   const empty = document.getElementById("empty");
   container.innerHTML = "";
   if (!tasks.length) {
     empty.style.display = "block";
-    return;
+  } else {
+    empty.style.display = "none";
+    tasks.forEach((task) => container.appendChild(renderTask(task)));
   }
-  empty.style.display = "none";
-  tasks.forEach((task) => container.appendChild(renderTask(task)));
+  // Если открыта карточка — обновляем и её данными посвежее (кто-то мог
+  // взять задачу/прокомментировать, пока карточка была открыта).
+  if (openTaskId !== null) {
+    const fresh = tasks.find((t) => t.id === openTaskId);
+    if (fresh) renderCard(fresh); else closeCard();
+  }
 }
+
+function renderCard(task) {
+  document.getElementById("card-no").textContent = padId(task.id);
+  document.getElementById("card-title").textContent = task.title;
+
+  const pill = document.getElementById("card-status-pill");
+  pill.dataset.status = task.status;
+  pill.textContent = statusLabel(task.status) + (task.claimed_by ? ` · ${task.claimed_by}` : "");
+
+  document.getElementById("card-meta").textContent = `Создал ${task.created_by} · ${fmtTime(task.created_at)}`;
+
+  const actions = document.getElementById("card-actions");
+  actions.innerHTML = "";
+  actions.appendChild(buildTaskActions(task));
+
+  const description = document.getElementById("card-description");
+  if (document.activeElement !== description) description.value = task.description || "";
+
+  renderComments(document.getElementById("card-comments"), task.comments);
+}
+
+function openCard(taskId) {
+  const task = latestTasks.find((t) => t.id === taskId);
+  if (!task) return;
+  openTaskId = taskId;
+  renderCard(task);
+  document.getElementById("card-overlay").classList.add("open");
+  if (tg && tg.BackButton) {
+    tg.BackButton.show();
+    tg.BackButton.onClick(closeCard);
+  }
+}
+
+function closeCard() {
+  openTaskId = null;
+  document.getElementById("card-overlay").classList.remove("open");
+  if (tg && tg.BackButton) {
+    tg.BackButton.hide();
+    tg.BackButton.offClick(closeCard);
+  }
+}
+
+document.getElementById("card-back").addEventListener("click", closeCard);
+
+document.getElementById("card-description-save").addEventListener("click", async () => {
+  if (openTaskId === null) return;
+  const text = document.getElementById("card-description").value.trim();
+  try {
+    await act(`/api/tasks/${openTaskId}/description`, { description: text });
+  } catch (e) {
+    showError(e.message);
+  }
+});
+
+document.getElementById("card-comment-send").addEventListener("click", async () => {
+  if (openTaskId === null) return;
+  const input = document.getElementById("card-comment-input");
+  const text = input.value.trim();
+  if (!text) return;
+  try {
+    await act(`/api/tasks/${openTaskId}/comment`, { text });
+    input.value = "";
+  } catch (e) {
+    showError(e.message);
+  }
+});
 
 document.getElementById("new-task-btn").addEventListener("click", async () => {
   const input = document.getElementById("new-task-input");
   const title = input.value.trim();
   if (!title) return;
-  await api("/api/tasks/create", { title });
-  input.value = "";
-  await loadTasks();
+  try {
+    await api("/api/tasks/create", { title });
+    input.value = "";
+    await loadTasks();
+  } catch (e) {
+    showError(e.message);
+  }
+});
+document.getElementById("new-task-input").addEventListener("keydown", (e) => {
+  if (e.key === "Enter") document.getElementById("new-task-btn").click();
 });
 
-loadTasks();
-// Живое обновление без вебсокетов — простое поллинг раз в 5с достаточно
-// для команды из нескольких человек, не усложняем инфраструктуру.
-setInterval(loadTasks, 5000);
+loadTasks().catch((e) => showError(e.message));
+// Живое обновление без вебсокетов — поллинг раз в 5с достаточно для команды
+// из нескольких человек, не усложняем инфраструктуру ради «реального времени».
+setInterval(() => loadTasks().catch((e) => showError(e.message)), 5000);
 </script>
 </body>
 </html>

@@ -17,7 +17,7 @@ class Comment:
 class Task:
     id: int
     title: str
-    status: str  # "open" | "done"
+    status: str  # "open" | "testing" | "done"
     claimed_by: str | None
     created_by: str
     created_at: str
@@ -26,6 +26,11 @@ class Task:
     # если зеркалирование не настроено или упало (доска остаётся источником
     # правды в любом случае).
     reminder_uid: str | None = None
+    # Telegram user id того, кто взял задачу — нужен для настоящего
+    # @упоминания в ежедневном дайджесте (shared/reminder_digest.py), просто
+    # имени недостаточно, чтобы Telegram подсветил и уведомил человека.
+    claimed_by_user_id: int | None = None
+    description: str | None = None
     comments: list[Comment] = field(default_factory=list)
 
 
@@ -56,6 +61,14 @@ class TaskStore:
         finally:
             conn.close()
 
+    # Колонки, добавленные после первой версии схемы — для файлов БД,
+    # созданных до них, накатываем через ALTER TABLE (см. _init_schema).
+    # Новую версию схемы просто дополняй этим словарём, без ручных миграций.
+    _ADDED_COLUMNS = {
+        "claimed_by_user_id": "INTEGER",
+        "description": "TEXT",
+    }
+
     def _init_schema(self) -> None:
         with self._connect() as conn:
             conn.execute(
@@ -72,6 +85,10 @@ class TaskStore:
                 )
                 """
             )
+            existing_columns = {row["name"] for row in conn.execute("PRAGMA table_info(tasks)").fetchall()}
+            for column, sql_type in self._ADDED_COLUMNS.items():
+                if column not in existing_columns:
+                    conn.execute(f"ALTER TABLE tasks ADD COLUMN {column} {sql_type}")
             conn.execute(
                 """
                 CREATE TABLE IF NOT EXISTS task_comments (
@@ -84,11 +101,11 @@ class TaskStore:
                 """
             )
 
-    def add_task(self, title: str, created_by: str) -> Task:
+    def add_task(self, title: str, created_by: str, description: str = "") -> Task:
         with self._connect() as conn:
             cursor = conn.execute(
-                "INSERT INTO tasks (title, status, created_by, created_at) VALUES (?, 'open', ?, ?)",
-                (title, created_by, _now()),
+                "INSERT INTO tasks (title, status, created_by, created_at, description) VALUES (?, 'open', ?, ?, ?)",
+                (title, created_by, _now(), description or None),
             )
             task_id = cursor.lastrowid
         return self.get_task(task_id)
@@ -114,11 +131,20 @@ class TaskStore:
             task.comments = self._load_comments(conn, task_id)
         return task
 
-    def claim_task(self, task_id: int, claimed_by: str) -> Task:
-        return self._update_or_raise(task_id, "UPDATE tasks SET claimed_by = ? WHERE id = ?", (claimed_by, task_id))
+    def claim_task(self, task_id: int, claimed_by: str, claimed_by_user_id: int | None = None) -> Task:
+        return self._update_or_raise(
+            task_id,
+            "UPDATE tasks SET claimed_by = ?, claimed_by_user_id = ? WHERE id = ?",
+            (claimed_by, claimed_by_user_id, task_id),
+        )
 
     def unclaim_task(self, task_id: int) -> Task:
-        return self._update_or_raise(task_id, "UPDATE tasks SET claimed_by = NULL WHERE id = ?", (task_id,))
+        return self._update_or_raise(
+            task_id, "UPDATE tasks SET claimed_by = NULL, claimed_by_user_id = NULL WHERE id = ?", (task_id,)
+        )
+
+    def mark_testing(self, task_id: int) -> Task:
+        return self._update_or_raise(task_id, "UPDATE tasks SET status = 'testing' WHERE id = ?", (task_id,))
 
     def complete_task(self, task_id: int) -> Task:
         return self._update_or_raise(
@@ -126,6 +152,8 @@ class TaskStore:
         )
 
     def reopen_task(self, task_id: int) -> Task:
+        # Возвращает в "open" из любого статуса (testing или done) — единая
+        # операция, а не отдельная для каждого предыдущего состояния.
         return self._update_or_raise(
             task_id, "UPDATE tasks SET status = 'open', completed_at = NULL WHERE id = ?", (task_id,)
         )
@@ -133,6 +161,11 @@ class TaskStore:
     def set_reminder_uid(self, task_id: int, reminder_uid: str) -> None:
         with self._connect() as conn:
             conn.execute("UPDATE tasks SET reminder_uid = ? WHERE id = ?", (reminder_uid, task_id))
+
+    def set_description(self, task_id: int, description: str) -> Task:
+        return self._update_or_raise(
+            task_id, "UPDATE tasks SET description = ? WHERE id = ?", (description or None, task_id)
+        )
 
     def add_comment(self, task_id: int, author: str, text: str) -> Task:
         with self._connect() as conn:
@@ -170,6 +203,8 @@ def _row_to_task(row: sqlite3.Row) -> Task:
         created_at=row["created_at"],
         completed_at=row["completed_at"],
         reminder_uid=row["reminder_uid"],
+        claimed_by_user_id=row["claimed_by_user_id"],
+        description=row["description"],
     )
 
 

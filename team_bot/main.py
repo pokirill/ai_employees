@@ -4,6 +4,7 @@ import asyncio
 import logging
 import re
 from collections import defaultdict, deque
+from datetime import datetime, timedelta
 
 from aiogram import Bot, Dispatcher, F
 from aiogram.client.default import DefaultBotProperties
@@ -18,6 +19,7 @@ from shared.icloud_reminders import ICloudReminders
 from shared.icloud_reminders import TaskNotFound as ReminderTaskNotFound
 from shared.llm_client import LLMClient
 from shared.rate_limiter import SlidingWindowLimiter
+from shared.reminder_digest import build_reminder_digest
 from shared.task_store import TaskNotFound, TaskStore
 
 logging.basicConfig(level=logging.INFO)
@@ -79,7 +81,8 @@ async def cmd_help(message: Message) -> None:
         "(можно ответить командой /task на чьё-то сообщение — возьму текст оттуда)\n"
         "/tasks — показать незавершённые задачи\n"
         "/done &lt;номер&gt; — отметить задачу выполненной\n"
-        "/board — открыть доску задач (мини-апп: взять себе, комментарии, статус) — в личке\n\n"
+        "/board — открыть доску задач (мини-апп: взять себе, комментарии, статус) — в личке\n"
+        "/remindnow — прислать дайджест открытых задач сейчас (обычно раз в день сам)\n\n"
         "<b>Ассистент</b>\n"
         "/ask &lt;вопрос&gt; — спросить про проект (контекст из Docs/ обоих репо)\n"
         "В группе: упомяни меня (@бот вопрос) или ответь на моё сообщение\n"
@@ -129,7 +132,8 @@ async def cmd_tasks(message: Message) -> None:
     lines = []
     for task in tasks:
         claim = f" (взял: {task.claimed_by})" if task.claimed_by else ""
-        lines.append(f"#{task.id} {task.title}{claim}")
+        testing = " [тестируется]" if task.status == "testing" else ""
+        lines.append(f"#{task.id} {task.title}{testing}{claim}")
     await message.answer(
         "Незавершённые задачи:\n" + "\n".join(lines) + "\n\nОтметить выполненной: /done <номер>, или /board"
     )
@@ -180,7 +184,43 @@ async def cmd_board(message: Message) -> None:
     await message.answer("Доска задач команды:", reply_markup=keyboard)
 
 
+@dp.message(Command("remindnow"))
+async def cmd_remind_now(message: Message) -> None:
+    # Ручной триггер того же дайджеста, что шлёт reminder_loop раз в день —
+    # чтобы проверить формат/содержание, не дожидаясь TEAM_REMINDER_HOUR.
+    digest = build_reminder_digest(tasks_store.list_tasks(include_done=False))
+    await message.answer(digest or "Открытых задач нет — напоминать не о чем 🎉")
+
+
+def _seconds_until_next_reminder() -> float:
+    now = datetime.now()
+    target = now.replace(hour=config.reminder_hour, minute=0, second=0, microsecond=0)
+    if target <= now:
+        target += timedelta(days=1)
+    return (target - now).total_seconds()
+
+
+async def reminder_loop() -> None:
+    # Раз в сутки, в config.reminder_hour по местному времени машины —
+    # дайджест открытых задач в TEAM_CHAT_ID. Не персистится и не защищено от
+    # пропуска при рестарте бота ровно в момент отправки — это ежедневное
+    # напоминание, не критичная нотификация, простой sleep-цикл достаточен.
+    while True:
+        try:
+            await asyncio.sleep(_seconds_until_next_reminder())
+            digest = build_reminder_digest(tasks_store.list_tasks(include_done=False))
+            if digest:
+                await bot.send_message(config.team_chat_id, digest)
+        except Exception:
+            logger.exception("Reminder loop iteration failed")
+
+
 def _ask_llm(chat_id: int, question: str, *, force_context: bool = False) -> str:
+    if not llm.config.api_key:
+        # OPENROUTER_API_KEY не обязателен для старта бота (задачи/доска не
+        # используют LLM), но без него ассистент отвечать не может — явная
+        # ошибка пользователю лучше молчания.
+        raise RuntimeError("Ассистент ещё не настроен: не задан OPENROUTER_API_KEY.")
     # R-COST: контекст грузим, только если он реально нужен — иначе на
     # "привет"/"спасибо" улетал бы тот же объём токенов, что на серьёзный
     # архитектурный вопрос. /ask — явное намерение спросить, форсируем контекст.
@@ -203,6 +243,17 @@ def _ask_llm(chat_id: int, question: str, *, force_context: bool = False) -> str
     return answer
 
 
+def _assistant_error_message(exc: Exception) -> str:
+    # Наши собственные сообщения (например, "не настроен OPENROUTER_API_KEY")
+    # безопасно показать как есть. Остальное — сеть/провайдер/неожиданное —
+    # логируем полностью, но в чат не тащим детали (могут содержать служебную
+    # информацию о запросе), чтобы не палить внутренности бота в общем чате.
+    logger.exception("Assistant call failed")
+    if isinstance(exc, RuntimeError):
+        return str(exc)
+    return "Не получилось спросить ассистента — что-то не так на стороне LLM-провайдера. Попробуй ещё раз чуть позже."
+
+
 def _reject_if_rate_limited(message: Message) -> bool:
     """True, если сообщение НАДО отклонить (лимит исчерпан) — уже отправляет
     юзеру объяснение сама, вызывающему коду останется просто return."""
@@ -222,7 +273,11 @@ async def cmd_ask(message: Message, command: CommandObject) -> None:
         await message.answer(f"⏳ Лимит вопросов на этот час исчерпан. Попробуй через ~{wait_min} мин.")
         return
     await bot.send_chat_action(message.chat.id, "typing")
-    answer = _ask_llm(message.chat.id, question, force_context=True)
+    try:
+        answer = _ask_llm(message.chat.id, question, force_context=True)
+    except Exception as exc:
+        await message.answer(f"⚠️ {_assistant_error_message(exc)}")
+        return
     await message.answer(answer or "Не получилось сформулировать ответ.")
 
 
@@ -267,7 +322,11 @@ async def handle_assistant_message(message: Message) -> None:
         await message.reply(f"⏳ Лимит вопросов на этот час исчерпан. Попробуй через ~{wait_min} мин.")
         return
     await bot.send_chat_action(message.chat.id, "typing")
-    answer = _ask_llm(message.chat.id, question)
+    try:
+        answer = _ask_llm(message.chat.id, question)
+    except Exception as exc:
+        await message.answer(f"⚠️ {_assistant_error_message(exc)}")
+        return
     await message.answer(answer or "Не получилось сформулировать ответ.")
 
 
@@ -276,6 +335,10 @@ async def main() -> None:
     global _bot_username
     _bot_username = me.username
     logger.info("Bot username resolved: @%s", _bot_username)
+    if config.team_chat_id:
+        asyncio.create_task(reminder_loop())
+    else:
+        logger.info("TEAM_CHAT_ID не задан — ежедневный дайджест отключён (доступен вручную через /remindnow)")
     await dp.start_polling(bot)
 
 

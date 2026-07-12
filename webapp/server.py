@@ -38,10 +38,15 @@ class InitDataPayload(BaseModel):
 
 class NewTaskPayload(InitDataPayload):
     title: str
+    description: str = ""
 
 
 class CommentPayload(InitDataPayload):
     text: str
+
+
+class DescriptionPayload(InitDataPayload):
+    description: str
 
 
 def _authenticated_user(init_data: str) -> dict:
@@ -64,8 +69,10 @@ def _task_to_dict(task: Task) -> dict:
     return {
         "id": task.id,
         "title": task.title,
+        "description": task.description,
         "status": task.status,
         "claimed_by": task.claimed_by,
+        "claimed_by_user_id": task.claimed_by_user_id,
         "created_by": task.created_by,
         "created_at": task.created_at,
         "completed_at": task.completed_at,
@@ -85,13 +92,26 @@ def create_task(payload: NewTaskPayload) -> dict:
     title = payload.title.strip()
     if not title:
         raise HTTPException(status_code=400, detail="Пустое название задачи")
-    return _task_to_dict(_store.add_task(title, created_by=_display_name(user)))
+    task = _store.add_task(title, created_by=_display_name(user), description=payload.description.strip())
+    return _task_to_dict(task)
 
 
 @app.post("/api/tasks/{task_id}/claim")
 def claim_task(task_id: int, payload: InitDataPayload) -> dict:
     user = _authenticated_user(payload.init_data)
-    return _with_404(lambda: _store.claim_task(task_id, _display_name(user)))
+    return _with_404(lambda: _store.claim_task(task_id, _display_name(user), user.get("id")))
+
+
+@app.post("/api/tasks/{task_id}/testing")
+def mark_testing(task_id: int, payload: InitDataPayload) -> dict:
+    _authenticated_user(payload.init_data)
+    return _with_404(lambda: _store.mark_testing(task_id))
+
+
+@app.post("/api/tasks/{task_id}/description")
+def set_description(task_id: int, payload: DescriptionPayload) -> dict:
+    _authenticated_user(payload.init_data)
+    return _with_404(lambda: _store.set_description(task_id, payload.description.strip()))
 
 
 @app.post("/api/tasks/{task_id}/unclaim")

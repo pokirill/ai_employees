@@ -22,9 +22,14 @@ def _optional(name: str, default: str = "") -> str:
 @dataclass(frozen=True)
 class TeamBotConfig:
     telegram_token: str = field(default_factory=lambda: _require("TEAM_BOT_TOKEN"))
-    team_chat_id: str = field(default_factory=lambda: _require("TEAM_CHAT_ID"))
-    icloud_apple_id: str = field(default_factory=lambda: _require("ICLOUD_APPLE_ID"))
-    icloud_app_password: str = field(default_factory=lambda: _require("ICLOUD_APP_SPECIFIC_PASSWORD"))
+    # Не используется в коде нигде, кроме документации/референса — не блокируем
+    # старт бота её отсутствием.
+    team_chat_id: str = field(default_factory=lambda: _optional("TEAM_CHAT_ID"))
+    # iCloud — best-effort зеркало (см. team_bot/main.py cmd_task/cmd_done), не
+    # обязательное условие для работы доски задач/ассистента. Пусто → /task
+    # просто не пытается зеркалировать, доска всё равно работает.
+    icloud_apple_id: str = field(default_factory=lambda: _optional("ICLOUD_APPLE_ID"))
+    icloud_app_password: str = field(default_factory=lambda: _optional("ICLOUD_APP_SPECIFIC_PASSWORD"))
     icloud_reminders_list_name: str = field(
         default_factory=lambda: _optional("ICLOUD_REMINDERS_LIST_NAME", "Кубышка — задачи")
     )
@@ -47,6 +52,10 @@ class TeamBotConfig:
     max_questions_per_hour: int = field(
         default_factory=lambda: int(_optional("TEAM_BOT_MAX_QUESTIONS_PER_HOUR", "30"))
     )
+    # Час (по локальному времени машины, где крутится бот) ежедневного
+    # дайджеста открытых задач в TEAM_CHAT_ID. Не шлётся, если team_chat_id
+    # не задан (см. team_bot/main.py reminder_loop).
+    reminder_hour: int = field(default_factory=lambda: int(_optional("TEAM_REMINDER_HOUR", "10")))
 
     @property
     def docs_paths(self) -> list[str]:
@@ -85,6 +94,9 @@ class TaskBoardConfig:
 class LLMConfig:
     # OpenRouter — OpenAI-совместимый API, но другой base_url и модели с
     # префиксом провайдера (например "openai/gpt-5-mini", "anthropic/claude-...").
-    api_key: str = field(default_factory=lambda: _require("OPENROUTER_API_KEY"))
+    # Не обязателен для старта бота — команды /task, /tasks, /done, /board не
+    # используют LLM вообще; отсутствие ключа падает только при реальной
+    # попытке спросить ассистента (см. team_bot/main.py _ask_llm).
+    api_key: str = field(default_factory=lambda: _optional("OPENROUTER_API_KEY"))
     model: str = field(default_factory=lambda: _optional("OPENROUTER_MODEL", "openai/gpt-5-mini"))
     base_url: str = field(default_factory=lambda: _optional("OPENROUTER_BASE_URL", "https://openrouter.ai/api/v1"))
