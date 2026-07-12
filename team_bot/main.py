@@ -14,7 +14,7 @@ from aiogram.types import BotCommand, InlineKeyboardButton, InlineKeyboardMarkup
 
 from shared.config import LLMConfig, TaskBoardConfig, TeamBotConfig
 from shared.context_heuristic import question_needs_project_context
-from shared.docs_context import load_project_context, sync_docs_repos
+from shared.docs_context import load_project_context, sync_docs_repos, topic_context_files
 from shared.icloud_reminders import ICloudReminders
 from shared.icloud_reminders import TaskNotFound as ReminderTaskNotFound
 from shared.llm_client import LLMClient
@@ -44,9 +44,19 @@ _rate_limiter = SlidingWindowLimiter(max_calls=config.max_questions_per_hour, wi
 # R-COST: контекст проекта (Docs/*.md обоих репо) — не на каждый вопрос, а
 # только когда похоже, что он реально нужен (см. question_needs_project_context).
 # Меньше max_chars, чем полный дефолт docs_context — команд-бот не обязан
-# видеть ВСЁ, только достаточно для конкретного вопроса.
-_CONTEXT_MAX_CHARS = 6000
-_ANSWER_MAX_TOKENS = 400
+# видеть ВСЁ, только достаточно для конкретного вопроса. Поднят с 6000 до
+# 9000: с добавлением тематических файлов (topic_context_files) есть что
+# реально положить в бюджет — раньше бот мог отвечать только по BACKLOG/
+# CHANGELOG/ARCHITECTURE, теперь по вопросу подключаются файлы вроде
+# BUSINESS_LOGIC.md/ONBOARDING_FLOW.md/GOALS_SCREEN.md и т.п.
+_CONTEXT_MAX_CHARS = 9000
+# gpt-5-mini — reasoning-модель: часть max_completion_tokens тратится на
+# СКРЫТЫЕ reasoning-токены ДО видимого ответа. При 400 с богатым контекстом
+# модель реально гасила весь бюджет на reasoning и возвращала пустую строку
+# (finish_reason=length, reasoning_tokens=400, content="") — поймано не
+# рассуждением, а настоящим вызовом API на реальном вопросе. 1200 — минимум,
+# при котором в тестах стабильно оставалось место на видимый ответ.
+_ANSWER_MAX_TOKENS = 1200
 
 bot = Bot(token=config.telegram_token, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
 dp = Dispatcher()
@@ -344,7 +354,8 @@ def _ask_llm(history_key: _HistoryKey, question: str, *, force_context: bool = F
     # архитектурный вопрос. /ask — явное намерение спросить, форсируем контекст.
     if force_context or question_needs_project_context(question):
         sync_docs_repos(config.docs_paths)
-        context = load_project_context(config.docs_paths, max_chars=_CONTEXT_MAX_CHARS)
+        extra_files = topic_context_files(question)
+        context = load_project_context(config.docs_paths, max_chars=_CONTEXT_MAX_CHARS, extra_filenames=extra_files)
         system_content = f"{_SYSTEM_PROMPT}\n\nКонтекст проекта:\n{context}"
     else:
         system_content = _SYSTEM_PROMPT

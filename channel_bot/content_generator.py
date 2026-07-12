@@ -15,13 +15,22 @@ _SYSTEM_PROMPT = (
 )
 
 
+# gpt-5-mini — reasoning-модель: часть max_completion_tokens уходит на
+# СКРЫТЫЕ reasoning-токены до видимого текста. При 400 модель на реальных
+# вызовах гасила весь бюджет на reasoning и возвращала пустую строку
+# (finish_reason=length, content="") — пойман настоящим вызовом API, не
+# только по описанию бага. 1200 — с запасом выше минимума, при котором в
+# тестах стабильно оставалось место на сам пост.
+_POST_MAX_TOKENS = 1200
+
+
 def _write_post(llm: LLMClient, topic: str) -> str:
     return llm.chat(
         [
             {"role": "system", "content": _SYSTEM_PROMPT},
             {"role": "user", "content": f"Тема поста:\n{topic}"},
         ],
-        max_tokens=400,
+        max_tokens=_POST_MAX_TOKENS,
     )
 
 
@@ -66,5 +75,5 @@ def generate_next_post(
                 ),
             },
         ],
-        max_tokens=400,
+        max_tokens=_POST_MAX_TOKENS,
     )
