@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import re
 from collections import defaultdict, deque
 
 from aiogram import Bot, Dispatcher, F
@@ -11,7 +12,7 @@ from aiogram.filters import Command, CommandObject
 from aiogram.types import Message
 
 from shared.config import LLMConfig, TeamBotConfig
-from shared.docs_context import load_project_context, sync_docs_repo
+from shared.docs_context import load_project_context, sync_docs_repos
 from shared.icloud_reminders import ICloudReminders, RemindersListNotFound, TaskNotFound
 from shared.llm_client import LLMClient
 
@@ -30,10 +31,12 @@ bot = Bot(token=config.telegram_token, default=DefaultBotProperties(parse_mode=P
 dp = Dispatcher()
 
 _SYSTEM_PROMPT = (
-    "Ты — ассистент команды разработки приложения «Кубышка» (FinAssist). "
-    "Отвечай кратко и по делу, на русском. Если вопрос касается архитектуры, "
-    "бэклога или истории решений проекта — опирайся на контекст ниже. Если "
-    "контекста не хватает — честно скажи, что не уверен, не выдумывай детали."
+    "Ты — ассистент команды разработки приложения «Кубышка» (iOS-репозиторий "
+    "FinAssist + бэкенд Finik-backend). Отвечай кратко и по делу, на русском. "
+    "Если вопрос касается архитектуры, бэклога или истории решений проекта — "
+    "опирайся на контекст ниже (там пометки [FinAssist]/[Finik-backend], "
+    "откуда какой факт). Если контекста не хватает — честно скажи, что не "
+    "уверен, не выдумывай детали."
 )
 
 # Короткая память диалога на чат — только для реплаев-продолжений /ask,
@@ -45,6 +48,10 @@ _conversation_history: dict[int, deque[dict[str, str]]] = defaultdict(lambda: de
 # Последний показанный /tasks список на чат — чтобы /done <номер> не заставлял
 # перечитывать CalDAV и не требовал вводить длинный uid руками.
 _last_shown_tasks: dict[int, list] = {}
+
+# Заполняется в main() через bot.get_me() перед стартом polling — нужен, чтобы
+# распознавать «@ИмяБота вопрос» в групповом чате как обращение к ассистенту.
+_bot_username: str | None = None
 
 
 @dp.message(Command("start"))
@@ -58,8 +65,9 @@ async def cmd_help(message: Message) -> None:
         "/tasks — показать незавершённые задачи списка\n"
         "/done &lt;номер&gt; — отметить задачу из /tasks выполненной\n\n"
         "<b>Ассистент</b>\n"
-        "/ask &lt;вопрос&gt; — спросить про проект (контекст из Docs/)\n"
-        "Просто ответь (reply) на мой ответ — продолжу разговор с учётом контекста\n\n"
+        "/ask &lt;вопрос&gt; — спросить про проект (контекст из Docs/ обоих репо)\n"
+        "В группе: упомяни меня (@бот вопрос) или ответь на моё сообщение\n"
+        "В личке: пиши что угодно, отвечу как ассистент без команд\n\n"
         "<b>Утилита</b>\n"
         "/id — показать ID этого чата (нужно для настройки)"
     )
@@ -146,8 +154,8 @@ async def cmd_done(message: Message, command: CommandObject) -> None:
 
 
 def _ask_llm(chat_id: int, question: str) -> str:
-    sync_docs_repo(config.finassist_docs_path)
-    context = load_project_context(config.finassist_docs_path)
+    sync_docs_repos(config.docs_paths)
+    context = load_project_context(config.docs_paths)
     history = list(_conversation_history[chat_id])
     messages = [{"role": "system", "content": f"{_SYSTEM_PROMPT}\n\nКонтекст проекта:\n{context}"}]
     messages.extend(history)
@@ -171,22 +179,52 @@ async def cmd_ask(message: Message, command: CommandObject) -> None:
     await message.answer(answer or "Не получилось сформулировать ответ.")
 
 
-@dp.message(F.reply_to_message.func(lambda m: m is not None) & F.text & ~F.text.startswith("/"))
-async def continue_conversation(message: Message) -> None:
-    # Продолжение диалога с ассистентом: юзер отвечает на СВОЁ же сообщение
-    # с /ask или на ответ бота — не нужно каждый раз перепечатывать /ask.
-    if not message.reply_to_message or message.reply_to_message.from_user is None:
-        return
-    if message.reply_to_message.from_user.id != bot.id:
-        return
-    if not message.text:
+def _strip_mention(text: str) -> str:
+    if not _bot_username:
+        return text
+    pattern = re.compile(re.escape(f"@{_bot_username}"), re.IGNORECASE)
+    return pattern.sub("", text).strip()
+
+
+def _is_reply_to_bot(message: Message) -> bool:
+    reply = message.reply_to_message
+    return bool(reply and reply.from_user and reply.from_user.id == bot.id)
+
+
+def _mentions_bot(message: Message) -> bool:
+    if not _bot_username or not message.text:
+        return False
+    return f"@{_bot_username.lower()}" in message.text.lower()
+
+
+def _should_respond_as_assistant(message: Message) -> bool:
+    if not message.text or message.text.startswith("/"):
+        return False
+    # Личка — всегда диалог с ассистентом, обращение по имени избыточно.
+    if message.chat.type == "private":
+        return True
+    # В группе — только если реально ОБРАТИЛИСЬ: ответили на сообщение бота
+    # или упомянули его по имени. Отвечать на каждую реплику в общем чате
+    # было бы шумно (та же логика, что и в channel_bot для чата обсуждения).
+    return _is_reply_to_bot(message) or _mentions_bot(message)
+
+
+@dp.message(F.func(_should_respond_as_assistant))
+async def handle_assistant_message(message: Message) -> None:
+    question = _strip_mention(message.text or "")
+    if not question:
+        await message.reply("Да? Спрашивай — я тут 🙂")
         return
     await bot.send_chat_action(message.chat.id, "typing")
-    answer = _ask_llm(message.chat.id, message.text.strip())
+    answer = _ask_llm(message.chat.id, question)
     await message.answer(answer or "Не получилось сформулировать ответ.")
 
 
 async def main() -> None:
+    me = await bot.get_me()
+    global _bot_username
+    _bot_username = me.username
+    logger.info("Bot username resolved: @%s", _bot_username)
     await dp.start_polling(bot)
 
 

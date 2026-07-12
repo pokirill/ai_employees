@@ -29,6 +29,21 @@ class TeamBotConfig:
         default_factory=lambda: _optional("ICLOUD_REMINDERS_LIST_NAME", "Кубышка — задачи")
     )
     finassist_docs_path: str = field(default_factory=lambda: _require("FINASSIST_DOCS_PATH"))
+    # Опционально: второй репозиторий (бэкенд) для контекста ассистента.
+    # Пусто → ассистент видит только FinAssist. По умолчанию — путь на этой
+    # машине, где оба репо лежат рядом в рамках одной сессии разработки.
+    finik_backend_docs_path: str = field(
+        default_factory=lambda: _optional(
+            "FINIK_BACKEND_DOCS_PATH", "/Users/arakcheevpm/Desktop/Кубышка/Finik-backend/docs"
+        )
+    )
+
+    @property
+    def docs_paths(self) -> list[str]:
+        paths = [self.finassist_docs_path]
+        if self.finik_backend_docs_path:
+            paths.append(self.finik_backend_docs_path)
+        return paths
 
 
 @dataclass(frozen=True)
