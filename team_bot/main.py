@@ -50,13 +50,12 @@ _rate_limiter = SlidingWindowLimiter(max_calls=config.max_questions_per_hour, wi
 # CHANGELOG/ARCHITECTURE, теперь по вопросу подключаются файлы вроде
 # BUSINESS_LOGIC.md/ONBOARDING_FLOW.md/GOALS_SCREEN.md и т.п.
 _CONTEXT_MAX_CHARS = 9000
-# gpt-5-mini — reasoning-модель: часть max_completion_tokens тратится на
-# СКРЫТЫЕ reasoning-токены ДО видимого ответа. При 400 с богатым контекстом
-# модель реально гасила весь бюджет на reasoning и возвращала пустую строку
-# (finish_reason=length, reasoning_tokens=400, content="") — поймано не
-# рассуждением, а настоящим вызовом API на реальном вопросе. 1200 — минимум,
-# при котором в тестах стабильно оставалось место на видимый ответ.
-_ANSWER_MAX_TOKENS = 1200
+# R-COST: LLMConfig.reasoning_effort="minimal" (см. shared/llm_client.py)
+# убирает налог на скрытые reasoning-токены reasoning-моделей — без него
+# 400 не хватало (модель гасила весь бюджет на "раздумья" и возвращала
+# пустую строку), с "minimal" даже меньшего бюджета хватает с запасом на
+# полноценный ответ (проверено реальным вызовом API).
+_ANSWER_MAX_TOKENS = 500
 
 bot = Bot(token=config.telegram_token, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
 dp = Dispatcher()

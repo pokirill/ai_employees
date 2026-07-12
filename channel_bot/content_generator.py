@@ -15,13 +15,10 @@ _SYSTEM_PROMPT = (
 )
 
 
-# gpt-5-mini — reasoning-модель: часть max_completion_tokens уходит на
-# СКРЫТЫЕ reasoning-токены до видимого текста. При 400 модель на реальных
-# вызовах гасила весь бюджет на reasoning и возвращала пустую строку
-# (finish_reason=length, content="") — пойман настоящим вызовом API, не
-# только по описанию бага. 1200 — с запасом выше минимума, при котором в
-# тестах стабильно оставалось место на сам пост.
-_POST_MAX_TOKENS = 1200
+# R-COST: LLMConfig.reasoning_effort="minimal" убирает налог на скрытые
+# reasoning-токены — без него 400 не хватало (см. память проекта/коммит
+# про пустые ответы), с "minimal" хватает даже меньшего бюджета с запасом.
+_POST_MAX_TOKENS = 500
 
 
 def _write_post(llm: LLMClient, topic: str) -> str:

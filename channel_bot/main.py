@@ -242,12 +242,10 @@ async def handle_discussion_message(message: Message) -> None:
             {"role": "system", "content": f"{_REPLY_SYSTEM_PROMPT}\n\nКонтекст проекта:\n{context}"},
             {"role": "user", "content": text},
         ],
-        # gpt-5-mini тратит часть бюджета на скрытые reasoning-токены до
-        # видимого текста — при 250 модель на реальных вызовах гасила весь
-        # бюджет на reasoning и возвращала пустую строку (см. такой же фикс
-        # в content_generator.py и team_bot/main.py). 700 — с запасом выше
-        # минимума, проверенного реальным вызовом API.
-        max_tokens=700,
+        # R-COST: LLMConfig.reasoning_effort="minimal" убирает налог на
+        # скрытые reasoning-токены (см. content_generator.py/team_bot/main.py) —
+        # без него 250 не хватало, с "minimal" хватает с запасом.
+        max_tokens=300,
     )
     if answer:
         await message.reply(answer)

@@ -110,3 +110,10 @@ class LLMConfig:
     # НЕ подставляет свой дефолт — пустая строка ломает запросы (httpx:
     # "missing http:// protocol"). Настраиваемо на случай прокси/шлюза.
     base_url: str = field(default_factory=lambda: _optional("OPENAI_BASE_URL", "https://api.openai.com/v1"))
+    # R-COST: reasoning-модели (gpt-5*, o1/o3/o4) по умолчанию тратят часть
+    # max_tokens на СКРЫТЫЕ reasoning-токены — на реальных вызовах это
+    # доводило до пустых ответов (весь бюджет уходил на "раздумья", см.
+    # AI_CHANGELOG/память проекта). "minimal" полностью убирает этот налог
+    # (проверено реальным вызовом: reasoning_tokens=0, полноценный ответ) —
+    # для простых Q&A/постов канала более глубокое рассуждение не нужно.
+    reasoning_effort: str = field(default_factory=lambda: _optional("OPENAI_REASONING_EFFORT", "minimal"))
