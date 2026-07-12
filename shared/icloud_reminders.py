@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import uuid
+from dataclasses import dataclass
 from datetime import datetime
 
 import caldav
@@ -10,6 +11,16 @@ _ICLOUD_CALDAV_URL = "https://caldav.icloud.com/"
 
 class RemindersListNotFound(RuntimeError):
     pass
+
+
+class TaskNotFound(RuntimeError):
+    pass
+
+
+@dataclass(frozen=True)
+class OpenTask:
+    uid: str
+    title: str
 
 
 class ICloudReminders:
@@ -63,6 +74,31 @@ class ICloudReminders:
         vtodo += "STATUS:NEEDS-ACTION\r\nEND:VTODO\r\nEND:VCALENDAR\r\n"
         todo_list.add_todo(vtodo)
         return uid
+
+    def list_open_tasks(self) -> list[OpenTask]:
+        """Незавершённые задачи списка, отсортированные как в приложении
+        (по due/priority — так же, как caldav.Calendar.todos() по умолчанию)."""
+        todo_list = self._resolve_list()
+        tasks: list[OpenTask] = []
+        for todo in todo_list.todos(include_completed=False):
+            component = todo.icalendar_component
+            title = str(component.get("summary", "(без названия)"))
+            uid = str(component.get("uid"))
+            tasks.append(OpenTask(uid=uid, title=title))
+        return tasks
+
+    def complete_task(self, uid: str) -> str:
+        """Отмечает задачу выполненной. Возвращает её название (для ответа
+        пользователю). Бросает TaskNotFound, если uid не найден среди
+        незавершённых задач списка."""
+        todo_list = self._resolve_list()
+        for todo in todo_list.todos(include_completed=False):
+            component = todo.icalendar_component
+            if str(component.get("uid")) == uid:
+                title = str(component.get("summary", "(без названия)"))
+                todo.complete()
+                return title
+        raise TaskNotFound(f"Задача с id {uid} не найдена среди незавершённых.")
 
 
 def _escape(text: str) -> str:

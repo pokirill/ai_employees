@@ -38,6 +38,11 @@ class ChannelBotConfig:
     discussion_chat_id: str = field(default_factory=lambda: _optional("DISCUSSION_CHAT_ID"))
     finassist_docs_path: str = field(default_factory=lambda: _require("FINASSIST_DOCS_PATH"))
     post_interval_hours: int = field(default_factory=lambda: int(_optional("POST_INTERVAL_HOURS", "24")))
+    # Чат, откуда разрешены админ-команды (/postnow, /queue, /status,
+    # /removetopic) — обычно тот же чат, что TEAM_CHAT_ID у team_bot. Не
+    # задан → команды доступны из любого чата (ок для локальной разработки,
+    # не для продакшена с открытым чатом обсуждения).
+    admin_chat_id: str = field(default_factory=lambda: _optional("CHANNEL_ADMIN_CHAT_ID"))
 
 
 @dataclass(frozen=True)
