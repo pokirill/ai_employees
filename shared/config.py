@@ -77,6 +77,12 @@ class ChannelBotConfig:
     # задан → команды доступны из любого чата (ок для локальной разработки,
     # не для продакшена с открытым чатом обсуждения).
     admin_chat_id: str = field(default_factory=lambda: _optional("CHANNEL_ADMIN_CHAT_ID"))
+    # R-COST: лимит ответов в чате обсуждения НА ПОЛЬЗОВАТЕЛЯ (не на чат целиком,
+    # это публичный community-чат — общий на всех лимит душил бы всех сразу
+    # из-за одного активного человека). 0 = выключено.
+    discussion_max_replies_per_hour: int = field(
+        default_factory=lambda: int(_optional("CHANNEL_DISCUSSION_MAX_REPLIES_PER_HOUR", "10"))
+    )
 
 
 @dataclass(frozen=True)

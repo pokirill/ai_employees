@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from channel_bot.changelog_entries import mark_title_used, next_unused_entry
-from channel_bot.content_queue import pop_next_topic
+from channel_bot.content_queue import peek_next_topic, pop_next_topic
 from shared.docs_context import load_project_context
 from shared.llm_client import LLMClient
 
@@ -32,14 +32,19 @@ def generate_next_post(
     changelog_path: str,
     used_state_path: str,
     docs_path: str,
+    dry_run: bool = False,
 ) -> str:
-    topic = pop_next_topic(queue_path)
+    """dry_run=True — для /preview: генерирует текст, НЕ трогая состояние
+    (не выкидывает тему из очереди, не помечает запись changelog
+    использованной), чтобы предпросмотр не "тратил" реальный контент."""
+    topic = peek_next_topic(queue_path) if dry_run else pop_next_topic(queue_path)
     if topic:
         return _write_post(llm, topic)
 
     entry = next_unused_entry(changelog_path, used_state_path)
     if entry:
-        mark_title_used(used_state_path, entry["title"])
+        if not dry_run:
+            mark_title_used(used_state_path, entry["title"])
         topic = f"{entry['title']}\n\n{entry['body']}"
         return _write_post(llm, topic)
 

@@ -3,7 +3,7 @@ from __future__ import annotations
 import sqlite3
 from contextlib import contextmanager
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 
 @dataclass
@@ -110,13 +110,23 @@ class TaskStore:
             task_id = cursor.lastrowid
         return self.get_task(task_id)
 
-    def list_tasks(self, *, include_done: bool = True) -> list[Task]:
-        query = "SELECT * FROM tasks"
+    def list_tasks(self, *, include_done: bool = True, done_within_days: int | None = None) -> list[Task]:
+        """done_within_days: если задан (и include_done=True), задачи со
+        статусом 'done', завершённые раньше этого срока, не возвращаются —
+        доска не должна расти в бесконечную ленту старых готовых задач.
+        Полная история всё равно доступна через include_done=True без этого
+        параметра (мини-апп даёт переключатель "показать всю историю")."""
+        query = "SELECT * FROM tasks WHERE 1=1"
+        params: list[str] = []
         if not include_done:
-            query += " WHERE status != 'done'"
+            query += " AND status != 'done'"
+        elif done_within_days is not None:
+            cutoff = (datetime.now(timezone.utc) - timedelta(days=done_within_days)).isoformat()
+            query += " AND (status != 'done' OR completed_at >= ?)"
+            params.append(cutoff)
         query += " ORDER BY (status = 'done'), created_at DESC"
         with self._connect() as conn:
-            rows = conn.execute(query).fetchall()
+            rows = conn.execute(query, params).fetchall()
             tasks = [_row_to_task(row) for row in rows]
             for task in tasks:
                 task.comments = self._load_comments(conn, task.id)
@@ -166,6 +176,9 @@ class TaskStore:
         return self._update_or_raise(
             task_id, "UPDATE tasks SET description = ? WHERE id = ?", (description or None, task_id)
         )
+
+    def rename_task(self, task_id: int, title: str) -> Task:
+        return self._update_or_raise(task_id, "UPDATE tasks SET title = ? WHERE id = ?", (title, task_id))
 
     def add_comment(self, task_id: int, author: str, text: str) -> Task:
         with self._connect() as conn:

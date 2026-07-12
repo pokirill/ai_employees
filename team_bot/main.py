@@ -10,7 +10,7 @@ from aiogram import Bot, Dispatcher, F
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
 from aiogram.filters import Command, CommandObject
-from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup, Message, WebAppInfo
+from aiogram.types import BotCommand, InlineKeyboardButton, InlineKeyboardMarkup, Message, WebAppInfo
 
 from shared.config import LLMConfig, TaskBoardConfig, TeamBotConfig
 from shared.context_heuristic import question_needs_project_context
@@ -60,11 +60,26 @@ _SYSTEM_PROMPT = (
     "уверен, не выдумывай детали."
 )
 
-# Короткая память диалога на чат — только для реплаев-продолжений /ask,
-# не персистится (перезапуск бота = чистый лист). 3 последних обмена
-# достаточно для уточняющих вопросов, не разрастаясь в полноценную БД.
+# Короткая память диалога — только для реплаев-продолжений /ask, не
+# персистится (перезапуск бота = чистый лист). 3 последних обмена достаточно
+# для уточняющих вопросов, не разрастаясь в полноценную БД.
+#
+# Ключ — (chat_id, user_id), НЕ просто chat_id: в групповом чате несколько
+# человек могут спрашивать ассистента одновременно, и если бы история была
+# общей на чат, продолжение (reply/упоминание) одного человека подмешивало
+# бы контекст чужого недавнего вопроса. Лимит вопросов в час (_rate_limiter)
+# сознательно остаётся per-chat — это защита бюджета, а не память диалога,
+# смешивать их не нужно.
 _MAX_HISTORY_MESSAGES = 6
-_conversation_history: dict[int, deque[dict[str, str]]] = defaultdict(lambda: deque(maxlen=_MAX_HISTORY_MESSAGES))
+_HistoryKey = tuple[int, int]
+_conversation_history: dict[_HistoryKey, deque[dict[str, str]]] = defaultdict(
+    lambda: deque(maxlen=_MAX_HISTORY_MESSAGES)
+)
+
+
+def _history_key(message: Message) -> _HistoryKey:
+    user_id = message.from_user.id if message.from_user else 0
+    return (message.chat.id, user_id)
 
 # Заполняется в main() через bot.get_me() перед стартом polling — нужен, чтобы
 # распознавать «@ИмяБота вопрос» в групповом чате как обращение к ассистенту.
@@ -80,8 +95,14 @@ async def cmd_help(message: Message) -> None:
         "/task &lt;текст&gt; — записать задачу на общую доску\n"
         "(можно ответить командой /task на чьё-то сообщение — возьму текст оттуда)\n"
         "/tasks — показать незавершённые задачи\n"
+        "/mytasks — задачи, которые взял именно я\n"
+        "/claim &lt;номер&gt; — взять задачу себе\n"
+        "/unclaim &lt;номер&gt; — отпустить задачу\n"
+        "/testing &lt;номер&gt; — отправить на тестирование\n"
         "/done &lt;номер&gt; — отметить задачу выполненной\n"
-        "/board — открыть доску задач (мини-апп: взять себе, комментарии, статус) — в личке\n"
+        "/comment &lt;номер&gt; &lt;текст&gt; — комментарий к задаче\n"
+        "/rename &lt;номер&gt; &lt;текст&gt; — переименовать задачу\n"
+        "/board — открыть доску задач (мини-апп: карточка, комментарии, статус) — в личке\n"
         "/remindnow — прислать дайджест открытых задач сейчас (обычно раз в день сам)\n\n"
         "<b>Ассистент</b>\n"
         "/ask &lt;вопрос&gt; — спросить про проект (контекст из Docs/ обоих репо)\n"
@@ -101,8 +122,11 @@ async def cmd_id(message: Message) -> None:
 @dp.message(Command("task"))
 async def cmd_task(message: Message, command: CommandObject) -> None:
     title = (command.args or "").strip()
-    if not title and message.reply_to_message and message.reply_to_message.text:
-        title = message.reply_to_message.text.strip()
+    if not title and message.reply_to_message:
+        # .text для обычных сообщений, .caption — если отвечают на фото/видео
+        # с подписью (например, скриншот бага с описанием в подписи).
+        reply = message.reply_to_message
+        title = (reply.text or reply.caption or "").strip()
     if not title:
         await message.answer(
             "Формат: /task купить домен для канала\n"
@@ -163,6 +187,100 @@ async def cmd_done(message: Message, command: CommandObject) -> None:
     await message.answer(f"✅ Готово: «{task.title}»")
 
 
+def _requester_identity(message: Message) -> tuple[str, int | None]:
+    if not message.from_user:
+        return "неизвестно", None
+    return message.from_user.full_name, message.from_user.id
+
+
+@dp.message(Command("claim"))
+async def cmd_claim(message: Message, command: CommandObject) -> None:
+    arg = (command.args or "").strip()
+    if not arg.isdigit():
+        await message.answer("Формат: /claim 7 (номер из /tasks или доски)")
+        return
+    name, user_id = _requester_identity(message)
+    try:
+        task = tasks_store.claim_task(int(arg), name, user_id)
+    except TaskNotFound:
+        await message.answer("⚠️ Задача с таким номером не найдена — проверь /tasks.")
+        return
+    await message.answer(f"🙋 Взял в работу: «{task.title}»")
+
+
+@dp.message(Command("unclaim"))
+async def cmd_unclaim(message: Message, command: CommandObject) -> None:
+    arg = (command.args or "").strip()
+    if not arg.isdigit():
+        await message.answer("Формат: /unclaim 7")
+        return
+    try:
+        task = tasks_store.unclaim_task(int(arg))
+    except TaskNotFound:
+        await message.answer("⚠️ Задача с таким номером не найдена — проверь /tasks.")
+        return
+    await message.answer(f"🔓 Отпустил: «{task.title}»")
+
+
+@dp.message(Command("testing"))
+async def cmd_testing(message: Message, command: CommandObject) -> None:
+    arg = (command.args or "").strip()
+    if not arg.isdigit():
+        await message.answer("Формат: /testing 7")
+        return
+    try:
+        task = tasks_store.mark_testing(int(arg))
+    except TaskNotFound:
+        await message.answer("⚠️ Задача с таким номером не найдена — проверь /tasks.")
+        return
+    await message.answer(f"🧪 На тестировании: «{task.title}»")
+
+
+@dp.message(Command("mytasks"))
+async def cmd_mytasks(message: Message) -> None:
+    _, user_id = _requester_identity(message)
+    mine = [t for t in tasks_store.list_tasks(include_done=False) if t.claimed_by_user_id == user_id]
+    if not mine:
+        await message.answer("У тебя сейчас нет задач в работе. Взять: /claim <номер> или /board")
+        return
+    lines = []
+    for task in mine:
+        testing = " [тестируется]" if task.status == "testing" else ""
+        lines.append(f"#{task.id} {task.title}{testing}")
+    await message.answer("Твои задачи в работе:\n" + "\n".join(lines))
+
+
+@dp.message(Command("comment"))
+async def cmd_comment(message: Message, command: CommandObject) -> None:
+    args = (command.args or "").strip()
+    parts = args.split(maxsplit=1)
+    if len(parts) < 2 or not parts[0].isdigit():
+        await message.answer("Формат: /comment 7 текст комментария")
+        return
+    name, _ = _requester_identity(message)
+    try:
+        task = tasks_store.add_comment(int(parts[0]), name, parts[1].strip())
+    except TaskNotFound:
+        await message.answer("⚠️ Задача с таким номером не найдена — проверь /tasks.")
+        return
+    await message.answer(f"💬 Комментарий добавлен к «{task.title}»")
+
+
+@dp.message(Command("rename"))
+async def cmd_rename(message: Message, command: CommandObject) -> None:
+    args = (command.args or "").strip()
+    parts = args.split(maxsplit=1)
+    if len(parts) < 2 or not parts[0].isdigit():
+        await message.answer("Формат: /rename 7 новое название задачи")
+        return
+    try:
+        task = tasks_store.rename_task(int(parts[0]), parts[1].strip())
+    except TaskNotFound:
+        await message.answer("⚠️ Задача с таким номером не найдена — проверь /tasks.")
+        return
+    await message.answer(f"✏️ Переименовано: «{task.title}»")
+
+
 @dp.message(Command("board"))
 async def cmd_board(message: Message) -> None:
     if not board_config.webapp_url:
@@ -215,7 +333,7 @@ async def reminder_loop() -> None:
             logger.exception("Reminder loop iteration failed")
 
 
-def _ask_llm(chat_id: int, question: str, *, force_context: bool = False) -> str:
+def _ask_llm(history_key: _HistoryKey, question: str, *, force_context: bool = False) -> str:
     if not llm.config.api_key:
         # OPENAI_API_KEY не обязателен для старта бота (задачи/доска не
         # используют LLM), но без него ассистент отвечать не может — явная
@@ -231,15 +349,15 @@ def _ask_llm(chat_id: int, question: str, *, force_context: bool = False) -> str
     else:
         system_content = _SYSTEM_PROMPT
 
-    history = list(_conversation_history[chat_id])
+    history = list(_conversation_history[history_key])
     messages = [{"role": "system", "content": system_content}]
     messages.extend(history)
     messages.append({"role": "user", "content": question})
 
     answer = llm.chat(messages, max_tokens=_ANSWER_MAX_TOKENS)
 
-    _conversation_history[chat_id].append({"role": "user", "content": question})
-    _conversation_history[chat_id].append({"role": "assistant", "content": answer})
+    _conversation_history[history_key].append({"role": "user", "content": question})
+    _conversation_history[history_key].append({"role": "assistant", "content": answer})
     return answer
 
 
@@ -274,7 +392,7 @@ async def cmd_ask(message: Message, command: CommandObject) -> None:
         return
     await bot.send_chat_action(message.chat.id, "typing")
     try:
-        answer = _ask_llm(message.chat.id, question, force_context=True)
+        answer = _ask_llm(_history_key(message), question, force_context=True)
     except Exception as exc:
         await message.answer(f"⚠️ {_assistant_error_message(exc)}")
         return
@@ -323,11 +441,30 @@ async def handle_assistant_message(message: Message) -> None:
         return
     await bot.send_chat_action(message.chat.id, "typing")
     try:
-        answer = _ask_llm(message.chat.id, question)
+        answer = _ask_llm(_history_key(message), question)
     except Exception as exc:
         await message.answer(f"⚠️ {_assistant_error_message(exc)}")
         return
     await message.answer(answer or "Не получилось сформулировать ответ.")
+
+
+_BOT_COMMANDS = [
+    BotCommand(command="task", description="Записать задачу на доску"),
+    BotCommand(command="tasks", description="Незавершённые задачи"),
+    BotCommand(command="mytasks", description="Задачи, которые взял я"),
+    BotCommand(command="claim", description="Взять задачу себе"),
+    BotCommand(command="unclaim", description="Отпустить задачу"),
+    BotCommand(command="testing", description="Отправить задачу на тестирование"),
+    BotCommand(command="done", description="Отметить задачу выполненной"),
+    BotCommand(command="comment", description="Комментарий к задаче"),
+    BotCommand(command="rename", description="Переименовать задачу"),
+    BotCommand(command="board", description="Доска задач (мини-апп)"),
+    BotCommand(command="remindnow", description="Дайджест открытых задач сейчас"),
+    BotCommand(command="ask", description="Спросить ассистента про проект"),
+    BotCommand(command="id", description="ID текущего чата"),
+    BotCommand(command="help", description="Список команд"),
+]
+
 
 
 async def main() -> None:
@@ -335,6 +472,8 @@ async def main() -> None:
     global _bot_username
     _bot_username = me.username
     logger.info("Bot username resolved: @%s", _bot_username)
+    # Без этого Telegram не показывает автодополнение команд при вводе "/".
+    await bot.set_my_commands(_BOT_COMMANDS)
     if config.team_chat_id:
         asyncio.create_task(reminder_loop())
     else:

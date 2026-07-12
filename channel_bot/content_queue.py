@@ -31,6 +31,13 @@ def pop_next_topic(path: str) -> str | None:
     return topic
 
 
+def peek_next_topic(path: str) -> str | None:
+    """Как pop_next_topic, но не убирает тему из очереди — для /preview,
+    чтобы предпросмотр не "тратил" реальную тему из очереди."""
+    items = load_queue(path)
+    return items[0] if items else None
+
+
 def append_topic(path: str, topic: str) -> None:
     items = load_queue(path)
     items.append(topic)

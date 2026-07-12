@@ -140,6 +140,20 @@
   .dot-testing { background: var(--testing); }
   .dot-done { background: var(--done); }
 
+  .history-toggle {
+    background: none;
+    border: none;
+    padding: 0;
+    margin-top: 6px;
+    font-family: var(--font-body);
+    font-size: 12px;
+    font-weight: 400;
+    color: var(--text-muted);
+    text-decoration: underline;
+    text-underline-offset: 2px;
+    cursor: pointer;
+  }
+
   ul.task-list { list-style: none; margin: 12px 0 0; padding: 0; display: flex; flex-direction: column; gap: 8px; }
 
   .task {
@@ -313,7 +327,16 @@
   }
   .card-back { padding: 6px 12px; }
   .card-scroll { flex: 1; overflow-y: auto; padding: 4px 16px calc(24px + env(safe-area-inset-bottom)); max-width: 640px; margin: 0 auto; width: 100%; }
-  .card-title { font-family: var(--font-display); font-weight: 800; font-size: 20px; margin: 6px 0 2px; text-wrap: balance; }
+  .card-title-row { display: flex; align-items: flex-start; gap: 8px; margin: 6px 0 2px; }
+  .card-title { font-family: var(--font-display); font-weight: 800; font-size: 20px; margin: 0; text-wrap: balance; flex: 1; }
+  #card-title-edit-btn { padding: 4px 9px; font-size: 11px; flex: none; }
+  .card-title-edit-row { display: none; gap: 6px; margin: 6px 0 2px; }
+  .card-title-edit-row.open { display: flex; }
+  .card-title-edit-row input {
+    flex: 1; min-width: 0; padding: 8px 10px; border-radius: 8px; border: 1px solid var(--border);
+    background: var(--surface-2); color: var(--text); font-family: var(--font-display); font-weight: 700;
+    font-size: 15px;
+  }
   .card-section { margin-top: 18px; }
   .card-section-label {
     font-family: var(--font-display);
@@ -350,6 +373,7 @@
     <header class="board-head">
       <h1>Доска задач «Кубышка»</h1>
       <div class="tally" id="tally"></div>
+      <button class="history-toggle" id="history-toggle">Показать всю историю</button>
       <div class="error-banner" id="error-banner"></div>
     </header>
 
@@ -368,7 +392,14 @@
     </div>
     <div class="card-scroll">
       <span class="task-no" id="card-no"></span>
-      <h2 class="card-title" id="card-title"></h2>
+      <div class="card-title-row">
+        <h2 class="card-title" id="card-title"></h2>
+        <button id="card-title-edit-btn" class="ghost">✏️</button>
+      </div>
+      <div class="card-title-edit-row" id="card-title-edit-row">
+        <input id="card-title-input" type="text" />
+        <button id="card-title-save" class="ghost">Сохранить</button>
+      </div>
       <div class="status-pill" id="card-status-pill"></div>
       <div class="task-meta" id="card-meta"></div>
 
@@ -408,6 +439,7 @@ if (tg) {
 const initData = tg ? tg.initData : "";
 let latestTasks = [];
 let openTaskId = null;
+let showAllHistory = false;
 
 async function api(path, body) {
   const res = await fetch(path, {
@@ -604,7 +636,7 @@ function renderTally(tasks) {
 }
 
 async function loadTasks() {
-  const tasks = await api("/api/tasks/list", {});
+  const tasks = await api("/api/tasks/list", { include_all: showAllHistory });
   latestTasks = tasks;
   renderTally(tasks);
   const container = document.getElementById("tasks");
@@ -666,6 +698,40 @@ function closeCard() {
 }
 
 document.getElementById("card-back").addEventListener("click", closeCard);
+
+document.getElementById("history-toggle").addEventListener("click", async () => {
+  showAllHistory = !showAllHistory;
+  document.getElementById("history-toggle").textContent = showAllHistory
+    ? "Скрыть старые готовые"
+    : "Показать всю историю";
+  try {
+    await loadTasks();
+  } catch (e) {
+    showError(e.message);
+  }
+});
+
+document.getElementById("card-title-edit-btn").addEventListener("click", () => {
+  const row = document.getElementById("card-title-edit-row");
+  const input = document.getElementById("card-title-input");
+  const isOpen = row.classList.toggle("open");
+  if (isOpen) {
+    input.value = document.getElementById("card-title").textContent;
+    input.focus();
+  }
+});
+
+document.getElementById("card-title-save").addEventListener("click", async () => {
+  if (openTaskId === null) return;
+  const title = document.getElementById("card-title-input").value.trim();
+  if (!title) return;
+  try {
+    await act(`/api/tasks/${openTaskId}/rename`, { title });
+    document.getElementById("card-title-edit-row").classList.remove("open");
+  } catch (e) {
+    showError(e.message);
+  }
+});
 
 document.getElementById("card-description-save").addEventListener("click", async () => {
   if (openTaskId === null) return;

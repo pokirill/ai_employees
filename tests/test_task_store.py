@@ -91,6 +91,39 @@ def test_missing_task_raises(store):
         store.set_description(999, "текст")
 
 
+def test_rename_task(store):
+    task = store.add_task("Опечатка", created_by="Аня")
+    renamed = store.rename_task(task.id, "Исправленное название")
+    assert renamed.title == "Исправленное название"
+    with pytest.raises(TaskNotFound):
+        store.rename_task(999, "текст")
+
+
+def test_list_tasks_hides_old_done_when_done_within_days_set(store, tmp_path):
+    from datetime import datetime, timedelta, timezone
+
+    recent = store.add_task("Недавно готова", created_by="Аня")
+    old = store.add_task("Давно готова", created_by="Аня")
+    still_open = store.add_task("Открытая", created_by="Аня")
+    store.complete_task(recent.id)
+    store.complete_task(old.id)
+
+    # Задаём completed_at "давней" задаче руками — complete_task всегда
+    # ставит текущее время, а нам нужно смоделировать реальную старость.
+    old_timestamp = (datetime.now(timezone.utc) - timedelta(days=30)).isoformat()
+    with store._connect() as conn:
+        conn.execute("UPDATE tasks SET completed_at = ? WHERE id = ?", (old_timestamp, old.id))
+
+    visible = store.list_tasks(done_within_days=7)
+    visible_ids = {t.id for t in visible}
+    assert recent.id in visible_ids
+    assert still_open.id in visible_ids
+    assert old.id not in visible_ids
+
+    full_history = store.list_tasks()
+    assert old.id in {t.id for t in full_history}
+
+
 def test_set_reminder_uid(store):
     task = store.add_task("Задача", created_by="Аня")
     store.set_reminder_uid(task.id, "uid-123")

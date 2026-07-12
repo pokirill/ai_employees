@@ -32,8 +32,18 @@ def index() -> FileResponse:
     return FileResponse(_STATIC_DIR / "index.html")
 
 
+_DEFAULT_DONE_VISIBLE_DAYS = 7
+
+
 class InitDataPayload(BaseModel):
     init_data: str
+
+
+class ListPayload(InitDataPayload):
+    # False (по умолчанию) → готовые задачи старше _DEFAULT_DONE_VISIBLE_DAYS
+    # скрыты — доска не должна расти в бесконечную ленту навсегда. True —
+    # показать всю историю (переключатель в UI).
+    include_all: bool = False
 
 
 class NewTaskPayload(InitDataPayload):
@@ -47,6 +57,10 @@ class CommentPayload(InitDataPayload):
 
 class DescriptionPayload(InitDataPayload):
     description: str
+
+
+class RenamePayload(InitDataPayload):
+    title: str
 
 
 def _authenticated_user(init_data: str) -> dict:
@@ -81,9 +95,10 @@ def _task_to_dict(task: Task) -> dict:
 
 
 @app.post("/api/tasks/list")
-def list_tasks(payload: InitDataPayload) -> list[dict]:
+def list_tasks(payload: ListPayload) -> list[dict]:
     _authenticated_user(payload.init_data)
-    return [_task_to_dict(t) for t in _store.list_tasks()]
+    done_within_days = None if payload.include_all else _DEFAULT_DONE_VISIBLE_DAYS
+    return [_task_to_dict(t) for t in _store.list_tasks(done_within_days=done_within_days)]
 
 
 @app.post("/api/tasks/create")
@@ -112,6 +127,15 @@ def mark_testing(task_id: int, payload: InitDataPayload) -> dict:
 def set_description(task_id: int, payload: DescriptionPayload) -> dict:
     _authenticated_user(payload.init_data)
     return _with_404(lambda: _store.set_description(task_id, payload.description.strip()))
+
+
+@app.post("/api/tasks/{task_id}/rename")
+def rename_task(task_id: int, payload: RenamePayload) -> dict:
+    _authenticated_user(payload.init_data)
+    title = payload.title.strip()
+    if not title:
+        raise HTTPException(status_code=400, detail="Пустое название задачи")
+    return _with_404(lambda: _store.rename_task(task_id, title))
 
 
 @app.post("/api/tasks/{task_id}/unclaim")
