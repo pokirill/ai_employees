@@ -9,25 +9,31 @@ from aiogram import Bot, Dispatcher, F
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
 from aiogram.filters import Command, CommandObject
-from aiogram.types import Message
+from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup, Message, WebAppInfo
 
-from shared.config import LLMConfig, TeamBotConfig
+from shared.config import LLMConfig, TaskBoardConfig, TeamBotConfig
 from shared.context_heuristic import question_needs_project_context
 from shared.docs_context import load_project_context, sync_docs_repos
-from shared.icloud_reminders import ICloudReminders, RemindersListNotFound, TaskNotFound
+from shared.icloud_reminders import ICloudReminders
+from shared.icloud_reminders import TaskNotFound as ReminderTaskNotFound
 from shared.llm_client import LLMClient
 from shared.rate_limiter import SlidingWindowLimiter
+from shared.task_store import TaskNotFound, TaskStore
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("team_bot")
 
 config = TeamBotConfig()
+board_config = TaskBoardConfig()
 llm = LLMClient(LLMConfig(), model_override=config.model_override)
 reminders = ICloudReminders(
     apple_id=config.icloud_apple_id,
     app_specific_password=config.icloud_app_password,
     list_name=config.icloud_reminders_list_name,
 )
+# Доска задач (мини-апп) — источник правды для claim/статус/комментариев,
+# Напоминания остаются best-effort зеркалом (см. cmd_task/cmd_done).
+tasks_store = TaskStore(board_config.db_path)
 
 # R-COST: см. shared/rate_limiter.py — не более N вопросов ассистенту в час
 # на чат, чтобы один болтливый чат не сжёг весь бюджет OpenRouter.
@@ -58,10 +64,6 @@ _SYSTEM_PROMPT = (
 _MAX_HISTORY_MESSAGES = 6
 _conversation_history: dict[int, deque[dict[str, str]]] = defaultdict(lambda: deque(maxlen=_MAX_HISTORY_MESSAGES))
 
-# Последний показанный /tasks список на чат — чтобы /done <номер> не заставлял
-# перечитывать CalDAV и не требовал вводить длинный uid руками.
-_last_shown_tasks: dict[int, list] = {}
-
 # Заполняется в main() через bot.get_me() перед стартом polling — нужен, чтобы
 # распознавать «@ИмяБота вопрос» в групповом чате как обращение к ассистенту.
 _bot_username: str | None = None
@@ -73,10 +75,11 @@ async def cmd_help(message: Message) -> None:
     await message.answer(
         "Привет! Я помощник команды по проекту «Кубышка».\n\n"
         "<b>Задачи</b>\n"
-        "/task &lt;текст&gt; — записать задачу в общий список Напоминаний\n"
+        "/task &lt;текст&gt; — записать задачу на общую доску\n"
         "(можно ответить командой /task на чьё-то сообщение — возьму текст оттуда)\n"
-        "/tasks — показать незавершённые задачи списка\n"
-        "/done &lt;номер&gt; — отметить задачу из /tasks выполненной\n\n"
+        "/tasks — показать незавершённые задачи\n"
+        "/done &lt;номер&gt; — отметить задачу выполненной\n"
+        "/board — открыть доску задач (мини-апп: взять себе, комментарии, статус) — в личке\n\n"
         "<b>Ассистент</b>\n"
         "/ask &lt;вопрос&gt; — спросить про проект (контекст из Docs/ обоих репо)\n"
         "В группе: упомяни меня (@бот вопрос) или ответь на моё сообщение\n"
@@ -104,39 +107,31 @@ async def cmd_task(message: Message, command: CommandObject) -> None:
         )
         return
     author = message.from_user.full_name if message.from_user else "неизвестно"
+    task = tasks_store.add_task(title, created_by=author)
     try:
-        reminders.add_task(title, notes=f"От {author} в Telegram")
-    except RemindersListNotFound as exc:
-        await message.answer(f"⚠️ {exc}")
-        return
+        uid = reminders.add_task(title, notes=f"От {author} в Telegram, доска #{task.id}")
+        tasks_store.set_reminder_uid(task.id, uid)
     except Exception:
-        logger.exception("Failed to add reminder")
-        await message.answer("⚠️ Не получилось записать задачу — попробуй ещё раз чуть позже.")
-        return
-    await message.answer(f"✅ Записал в Напоминания: «{title}»")
+        # Доска — источник правды, Напоминания — best-effort зеркало для тех,
+        # кто смотрит список на телефоне. Сбой зеркалирования (список ещё не
+        # расшарен, неверный пароль и т.п.) не должен ронять саму запись задачи.
+        logger.exception("Failed to mirror task to iCloud Reminders")
+    await message.answer(f"✅ Задача #{task.id} записана: «{title}»\nОткрыть доску: /board")
 
 
 @dp.message(Command("tasks"))
 async def cmd_tasks(message: Message) -> None:
-    try:
-        tasks = reminders.list_open_tasks()
-    except RemindersListNotFound as exc:
-        await message.answer(f"⚠️ {exc}")
-        return
-    except Exception:
-        logger.exception("Failed to list reminders")
-        await message.answer("⚠️ Не получилось прочитать список задач.")
-        return
-
+    tasks = tasks_store.list_tasks(include_done=False)
     if not tasks:
         await message.answer("Незавершённых задач нет 🎉")
-        _last_shown_tasks[message.chat.id] = []
         return
 
-    _last_shown_tasks[message.chat.id] = tasks
-    lines = [f"{i}. {task.title}" for i, task in enumerate(tasks, start=1)]
+    lines = []
+    for task in tasks:
+        claim = f" (взял: {task.claimed_by})" if task.claimed_by else ""
+        lines.append(f"#{task.id} {task.title}{claim}")
     await message.answer(
-        "Незавершённые задачи:\n" + "\n".join(lines) + "\n\nОтметить выполненной: /done <номер>"
+        "Незавершённые задачи:\n" + "\n".join(lines) + "\n\nОтметить выполненной: /done <номер>, или /board"
     )
 
 
@@ -144,27 +139,45 @@ async def cmd_tasks(message: Message) -> None:
 async def cmd_done(message: Message, command: CommandObject) -> None:
     arg = (command.args or "").strip()
     if not arg.isdigit():
-        await message.answer("Формат: /done 2 (номер из последнего /tasks)")
+        await message.answer("Формат: /done 7 (номер из /tasks или доски)")
         return
 
-    index = int(arg) - 1
-    cached = _last_shown_tasks.get(message.chat.id)
-    if not cached or not (0 <= index < len(cached)):
-        await message.answer("Сначала вызови /tasks, чтобы увидеть актуальные номера.")
-        return
-
-    task = cached[index]
     try:
-        title = reminders.complete_task(task.uid)
+        task = tasks_store.complete_task(int(arg))
     except TaskNotFound:
-        await message.answer("⚠️ Задача уже выполнена или удалена — обнови /tasks.")
-        return
-    except Exception:
-        logger.exception("Failed to complete reminder")
-        await message.answer("⚠️ Не получилось отметить задачу выполненной.")
+        await message.answer("⚠️ Задача с таким номером не найдена — проверь /tasks.")
         return
 
-    await message.answer(f"✅ Готово: «{title}»")
+    if task.reminder_uid:
+        try:
+            reminders.complete_task(task.reminder_uid)
+        except ReminderTaskNotFound:
+            pass
+        except Exception:
+            logger.exception("Failed to mirror completion to iCloud Reminders")
+
+    await message.answer(f"✅ Готово: «{task.title}»")
+
+
+@dp.message(Command("board"))
+async def cmd_board(message: Message) -> None:
+    if not board_config.webapp_url:
+        await message.answer(
+            "Мини-апп с доской задач ещё не задеплоен на публичный https-адрес "
+            "(WEBAPP_URL в .env) — как будет, здесь появится кнопка."
+        )
+        return
+    if message.chat.type != "private":
+        # Telegram открывает web_app-кнопки из инлайн-клавиатуры только в
+        # личном чате с ботом — в группе кнопка не сработает.
+        await message.answer("Открой доску в личке со мной — напиши мне /board напрямую.")
+        return
+    keyboard = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="📋 Открыть доску задач", web_app=WebAppInfo(url=board_config.webapp_url))]
+        ]
+    )
+    await message.answer("Доска задач команды:", reply_markup=keyboard)
 
 
 def _ask_llm(chat_id: int, question: str, *, force_context: bool = False) -> str:

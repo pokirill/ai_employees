@@ -71,6 +71,17 @@ class ChannelBotConfig:
 
 
 @dataclass(frozen=True)
+class TaskBoardConfig:
+    # Мини-апп с общей доской задач — sqlite как хранилище (см. shared/task_store.py).
+    db_path: str = field(default_factory=lambda: _optional("TASKS_DB_PATH", "kubyshka_tasks.db"))
+    # Публичный https-адрес, где хостится webapp/server.py (Telegram требует
+    # https для web_app-кнопок — localhost не подходит). Пусто → /board в
+    # team_bot сообщает, что мини-апп ещё не задеплоен, вместо падения.
+    webapp_url: str = field(default_factory=lambda: _optional("WEBAPP_URL"))
+    webapp_port: int = field(default_factory=lambda: int(_optional("WEBAPP_PORT", "8080")))
+
+
+@dataclass(frozen=True)
 class LLMConfig:
     # OpenRouter — OpenAI-совместимый API, но другой base_url и модели с
     # префиксом провайдера (например "openai/gpt-5-mini", "anthropic/claude-...").

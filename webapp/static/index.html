@@ -1,0 +1,213 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Кубышка — доска задач</title>
+<script src="https://telegram.org/js/telegram-web-app.js"></script>
+<style>
+  :root {
+    --bg: #ffffff;
+    --text: #111111;
+    --hint: #707579;
+    --link: #2481cc;
+    --button: #2481cc;
+    --button-text: #ffffff;
+    --card: #f4f4f5;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    padding: 12px;
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+    background: var(--bg);
+    color: var(--text);
+  }
+  h1 { font-size: 18px; margin: 4px 0 12px; }
+  .new-task { display: flex; gap: 6px; margin-bottom: 14px; }
+  .new-task input {
+    flex: 1; padding: 8px 10px; border-radius: 8px; border: 1px solid var(--hint);
+    background: var(--card); color: var(--text); font-size: 14px;
+  }
+  button {
+    border: none; border-radius: 8px; padding: 8px 12px; font-size: 13px;
+    background: var(--button); color: var(--button-text); cursor: pointer;
+  }
+  button.secondary { background: var(--card); color: var(--text); }
+  button:disabled { opacity: 0.5; cursor: default; }
+  .task {
+    background: var(--card); border-radius: 10px; padding: 10px 12px; margin-bottom: 10px;
+  }
+  .task.done { opacity: 0.6; }
+  .task-title { font-size: 15px; font-weight: 600; margin-bottom: 4px; }
+  .task-title.done { text-decoration: line-through; }
+  .task-meta { font-size: 12px; color: var(--hint); margin-bottom: 8px; }
+  .task-actions { display: flex; gap: 6px; flex-wrap: wrap; margin-bottom: 6px; }
+  .comments { margin-top: 6px; }
+  .comment { font-size: 12px; color: var(--text); margin-bottom: 3px; }
+  .comment b { color: var(--hint); font-weight: 500; }
+  .comment-row { display: flex; gap: 6px; margin-top: 6px; }
+  .comment-row input {
+    flex: 1; padding: 6px 8px; border-radius: 6px; border: 1px solid var(--hint);
+    background: var(--bg); color: var(--text); font-size: 12px;
+  }
+  .empty { color: var(--hint); font-size: 14px; text-align: center; margin-top: 40px; }
+</style>
+</head>
+<body>
+  <h1>Доска задач «Кубышка»</h1>
+  <div class="new-task">
+    <input id="new-task-input" type="text" placeholder="Новая задача…" />
+    <button id="new-task-btn">Добавить</button>
+  </div>
+  <div id="tasks"></div>
+  <div id="empty" class="empty" style="display:none">Задач пока нет 🎉</div>
+
+<script>
+const tg = window.Telegram && window.Telegram.WebApp;
+if (tg) { tg.ready(); tg.expand(); }
+
+// Мини-апп открывается только в контексте Telegram — initData подписана
+// на стороне клиента Telegram и проверяется сервером на каждый запрос
+// (см. shared/telegram_webapp_auth.py), так что без initData API просто
+// откажет с 401.
+const initData = tg ? tg.initData : "";
+
+async function api(path, body) {
+  const res = await fetch(path, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ init_data: initData, ...body }),
+  });
+  if (!res.ok) {
+    const detail = await res.json().catch(() => ({}));
+    throw new Error(detail.detail || `HTTP ${res.status}`);
+  }
+  return res.json();
+}
+
+function fmtTime(iso) {
+  try {
+    return new Date(iso).toLocaleString("ru-RU", { day: "2-digit", month: "2-digit", hour: "2-digit", minute: "2-digit" });
+  } catch {
+    return iso;
+  }
+}
+
+function renderTask(task) {
+  const el = document.createElement("div");
+  el.className = "task" + (task.status === "done" ? " done" : "");
+
+  const title = document.createElement("div");
+  title.className = "task-title" + (task.status === "done" ? " done" : "");
+  title.textContent = `#${task.id} ${task.title}`;
+  el.appendChild(title);
+
+  const meta = document.createElement("div");
+  meta.className = "task-meta";
+  const claimText = task.claimed_by ? ` · взял: ${task.claimed_by}` : "";
+  meta.textContent = `от ${task.created_by} · ${fmtTime(task.created_at)}${claimText}`;
+  el.appendChild(meta);
+
+  const actions = document.createElement("div");
+  actions.className = "task-actions";
+
+  if (task.status !== "done") {
+    if (task.claimed_by) {
+      actions.appendChild(makeButton("Отпустить", "secondary", () => act(`/api/tasks/${task.id}/unclaim`, {})));
+    } else {
+      actions.appendChild(makeButton("Взять себе", "", () => act(`/api/tasks/${task.id}/claim`, {})));
+    }
+    actions.appendChild(makeButton("Готово ✓", "", () => act(`/api/tasks/${task.id}/complete`, {})));
+  } else {
+    actions.appendChild(makeButton("Вернуть в работу", "secondary", () => act(`/api/tasks/${task.id}/reopen`, {})));
+  }
+  el.appendChild(actions);
+
+  if (task.comments.length) {
+    const comments = document.createElement("div");
+    comments.className = "comments";
+    task.comments.forEach((c) => {
+      const line = document.createElement("div");
+      line.className = "comment";
+      line.innerHTML = `<b>${escapeHtml(c.author)}:</b> ${escapeHtml(c.text)}`;
+      comments.appendChild(line);
+    });
+    el.appendChild(comments);
+  }
+
+  const commentRow = document.createElement("div");
+  commentRow.className = "comment-row";
+  const input = document.createElement("input");
+  input.type = "text";
+  input.placeholder = "Комментарий…";
+  const sendBtn = makeButton("→", "secondary", async () => {
+    const text = input.value.trim();
+    if (!text) return;
+    await act(`/api/tasks/${task.id}/comment`, { text });
+    input.value = "";
+  });
+  commentRow.appendChild(input);
+  commentRow.appendChild(sendBtn);
+  el.appendChild(commentRow);
+
+  return el;
+}
+
+function makeButton(label, cls, onClick) {
+  const btn = document.createElement("button");
+  btn.textContent = label;
+  if (cls) btn.className = cls;
+  btn.addEventListener("click", async () => {
+    btn.disabled = true;
+    try {
+      await onClick();
+    } catch (e) {
+      if (tg) tg.showAlert(e.message); else alert(e.message);
+    } finally {
+      btn.disabled = false;
+    }
+  });
+  return btn;
+}
+
+function escapeHtml(text) {
+  const div = document.createElement("div");
+  div.textContent = text;
+  return div.innerHTML;
+}
+
+async function act(path, body) {
+  await api(path, body);
+  await loadTasks();
+}
+
+async function loadTasks() {
+  const tasks = await api("/api/tasks/list", {});
+  const container = document.getElementById("tasks");
+  const empty = document.getElementById("empty");
+  container.innerHTML = "";
+  if (!tasks.length) {
+    empty.style.display = "block";
+    return;
+  }
+  empty.style.display = "none";
+  tasks.forEach((task) => container.appendChild(renderTask(task)));
+}
+
+document.getElementById("new-task-btn").addEventListener("click", async () => {
+  const input = document.getElementById("new-task-input");
+  const title = input.value.trim();
+  if (!title) return;
+  await api("/api/tasks/create", { title });
+  input.value = "";
+  await loadTasks();
+});
+
+loadTasks();
+// Живое обновление без вебсокетов — простое поллинг раз в 5с достаточно
+// для команды из нескольких человек, не усложняем инфраструктуру.
+setInterval(loadTasks, 5000);
+</script>
+</body>
+</html>
