@@ -38,6 +38,16 @@ class TeamBotConfig:
         )
     )
 
+    # R-COST: команд-бот — низкие ставки (внутренний Q&A), можно посадить на
+    # более дешёвую/быструю модель, не трогая ту, что настроена для канала.
+    # Пусто → берётся общий OPENROUTER_MODEL.
+    model_override: str = field(default_factory=lambda: _optional("TEAM_BOT_MODEL"))
+    # R-COST: не более N вопросов ассистенту в час НА ЧАТ — страховка от
+    # случайного/нарочного вычерпывания бюджета в бытовом чате. 0 = выключено.
+    max_questions_per_hour: int = field(
+        default_factory=lambda: int(_optional("TEAM_BOT_MAX_QUESTIONS_PER_HOUR", "30"))
+    )
+
     @property
     def docs_paths(self) -> list[str]:
         paths = [self.finassist_docs_path]

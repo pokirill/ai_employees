@@ -12,20 +12,33 @@ from aiogram.filters import Command, CommandObject
 from aiogram.types import Message
 
 from shared.config import LLMConfig, TeamBotConfig
+from shared.context_heuristic import question_needs_project_context
 from shared.docs_context import load_project_context, sync_docs_repos
 from shared.icloud_reminders import ICloudReminders, RemindersListNotFound, TaskNotFound
 from shared.llm_client import LLMClient
+from shared.rate_limiter import SlidingWindowLimiter
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("team_bot")
 
 config = TeamBotConfig()
-llm = LLMClient(LLMConfig())
+llm = LLMClient(LLMConfig(), model_override=config.model_override)
 reminders = ICloudReminders(
     apple_id=config.icloud_apple_id,
     app_specific_password=config.icloud_app_password,
     list_name=config.icloud_reminders_list_name,
 )
+
+# R-COST: см. shared/rate_limiter.py — не более N вопросов ассистенту в час
+# на чат, чтобы один болтливый чат не сжёг весь бюджет OpenRouter.
+_rate_limiter = SlidingWindowLimiter(max_calls=config.max_questions_per_hour, window_seconds=3600)
+
+# R-COST: контекст проекта (Docs/*.md обоих репо) — не на каждый вопрос, а
+# только когда похоже, что он реально нужен (см. question_needs_project_context).
+# Меньше max_chars, чем полный дефолт docs_context — команд-бот не обязан
+# видеть ВСЁ, только достаточно для конкретного вопроса.
+_CONTEXT_MAX_CHARS = 6000
+_ANSWER_MAX_TOKENS = 400
 
 bot = Bot(token=config.telegram_token, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
 dp = Dispatcher()
@@ -68,6 +81,7 @@ async def cmd_help(message: Message) -> None:
         "/ask &lt;вопрос&gt; — спросить про проект (контекст из Docs/ обоих репо)\n"
         "В группе: упомяни меня (@бот вопрос) или ответь на моё сообщение\n"
         "В личке: пиши что угодно, отвечу как ассистент без команд\n\n"
+        f"(до {config.max_questions_per_hour} вопросов ассистенту в час на чат — бережём бюджет)\n\n"
         "<b>Утилита</b>\n"
         "/id — показать ID этого чата (нужно для настройки)"
     )
@@ -153,19 +167,35 @@ async def cmd_done(message: Message, command: CommandObject) -> None:
     await message.answer(f"✅ Готово: «{title}»")
 
 
-def _ask_llm(chat_id: int, question: str) -> str:
-    sync_docs_repos(config.docs_paths)
-    context = load_project_context(config.docs_paths)
+def _ask_llm(chat_id: int, question: str, *, force_context: bool = False) -> str:
+    # R-COST: контекст грузим, только если он реально нужен — иначе на
+    # "привет"/"спасибо" улетал бы тот же объём токенов, что на серьёзный
+    # архитектурный вопрос. /ask — явное намерение спросить, форсируем контекст.
+    if force_context or question_needs_project_context(question):
+        sync_docs_repos(config.docs_paths)
+        context = load_project_context(config.docs_paths, max_chars=_CONTEXT_MAX_CHARS)
+        system_content = f"{_SYSTEM_PROMPT}\n\nКонтекст проекта:\n{context}"
+    else:
+        system_content = _SYSTEM_PROMPT
+
     history = list(_conversation_history[chat_id])
-    messages = [{"role": "system", "content": f"{_SYSTEM_PROMPT}\n\nКонтекст проекта:\n{context}"}]
+    messages = [{"role": "system", "content": system_content}]
     messages.extend(history)
     messages.append({"role": "user", "content": question})
 
-    answer = llm.chat(messages)
+    answer = llm.chat(messages, max_tokens=_ANSWER_MAX_TOKENS)
 
     _conversation_history[chat_id].append({"role": "user", "content": question})
     _conversation_history[chat_id].append({"role": "assistant", "content": answer})
     return answer
+
+
+def _reject_if_rate_limited(message: Message) -> bool:
+    """True, если сообщение НАДО отклонить (лимит исчерпан) — уже отправляет
+    юзеру объяснение сама, вызывающему коду останется просто return."""
+    if _rate_limiter.allow(message.chat.id):
+        return False
+    return True
 
 
 @dp.message(Command("ask"))
@@ -174,8 +204,12 @@ async def cmd_ask(message: Message, command: CommandObject) -> None:
     if not question:
         await message.answer("Формат: /ask почему подушка блокирует цели")
         return
+    if _reject_if_rate_limited(message):
+        wait_min = round(_rate_limiter.seconds_until_available(message.chat.id) / 60)
+        await message.answer(f"⏳ Лимит вопросов на этот час исчерпан. Попробуй через ~{wait_min} мин.")
+        return
     await bot.send_chat_action(message.chat.id, "typing")
-    answer = _ask_llm(message.chat.id, question)
+    answer = _ask_llm(message.chat.id, question, force_context=True)
     await message.answer(answer or "Не получилось сформулировать ответ.")
 
 
@@ -214,6 +248,10 @@ async def handle_assistant_message(message: Message) -> None:
     question = _strip_mention(message.text or "")
     if not question:
         await message.reply("Да? Спрашивай — я тут 🙂")
+        return
+    if _reject_if_rate_limited(message):
+        wait_min = round(_rate_limiter.seconds_until_available(message.chat.id) / 60)
+        await message.reply(f"⏳ Лимит вопросов на этот час исчерпан. Попробуй через ~{wait_min} мин.")
         return
     await bot.send_chat_action(message.chat.id, "typing")
     answer = _ask_llm(message.chat.id, question)
