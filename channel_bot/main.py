@@ -8,7 +8,7 @@ from aiogram import Bot, Dispatcher, F
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
 from aiogram.filters import Command, CommandObject
-from aiogram.types import BotCommand, BotCommandScopeChat, Message
+from aiogram.types import BotCommand, BotCommandScopeChat, CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message
 
 from channel_bot.content_generator import generate_next_post
 from channel_bot.content_queue import append_topic, load_queue, save_queue
@@ -48,6 +48,16 @@ _posting_paused = False
 # ждём весь POST_INTERVAL_HOURS до следующей попытки — это может стоить
 # целых суток пропущенного поста из-за разовой ошибки.
 _RETRY_DELAY_SECONDS = 30 * 60
+
+# Черновик, ожидающий решения админа (см. ChannelBotConfig.require_approval).
+# Не персистится между рестартами — если бот перезапустят с необработанным
+# черновиком, он просто сгенерирует новый на следующем цикле, старая тема
+# из очереди уже израсходована и это ок (не критичная потеря).
+_pending_draft: str | None = None
+_PENDING_DRAFT_RECHECK_SECONDS = 5 * 60
+_effective_require_approval = config.require_approval and bool(config.admin_chat_id)
+if config.require_approval and not config.admin_chat_id:
+    logger.warning("CHANNEL_REQUIRE_APPROVAL=1, но CHANNEL_ADMIN_CHAT_ID не задан — черновику некуда идти, постим как обычно")
 
 _REPLY_SYSTEM_PROMPT = (
     "Ты — Кубышка, бот приложения для личных финансов, отвечаешь в чате обсуждения "
@@ -125,8 +135,13 @@ async def cmd_status(message: Message) -> None:
         last_line = f"📝 Последний пост: {ago_hours} ч назад — «{title}»"
     else:
         last_line = "📝 Постов ещё не было"
+    if _effective_require_approval:
+        mode_line = "📝 Режим: черновик на ревью" + (" — сейчас есть черновик, ждёт решения" if _pending_draft else "")
+    else:
+        mode_line = "🤖 Режим: полная автономность"
     await message.answer(
         f"{'⏸ Автопостинг на паузе (/resume)' if _posting_paused else '▶️ Автопостинг активен'}\n"
+        f"{mode_line}\n"
         f"{last_line}\n"
         f"📋 Тем в очереди: {topics_count}\n"
         f"⏰ Интервал постинга: {config.post_interval_hours} ч\n"
@@ -198,20 +213,98 @@ async def cmd_preview(message: Message) -> None:
     await message.answer(f"👀 <b>Предпросмотр следующего поста:</b>\n\n{preview_text}")
 
 
+def _approval_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(text="✅ Опубликовать", callback_data="approve_post"),
+                InlineKeyboardButton(text="🗑 Пропустить", callback_data="reject_post"),
+            ]
+        ]
+    )
+
+
+async def _request_approval() -> None:
+    global _pending_draft
+    sync_docs_repo(config.finassist_docs_path)
+    post_text = generate_next_post(
+        llm,
+        queue_path=_QUEUE_PATH,
+        changelog_path=f"{config.finassist_docs_path}/AI_CHANGELOG.md",
+        used_state_path=_CHANGELOG_STATE_PATH,
+        docs_path=config.finassist_docs_path,
+    )
+    _pending_draft = post_text
+    await bot.send_message(
+        config.admin_chat_id, f"👀 <b>Черновик поста — нужно решение:</b>\n\n{post_text}", reply_markup=_approval_keyboard()
+    )
+
+
+def _is_admin_callback(callback: CallbackQuery) -> bool:
+    return bool(callback.message) and str(callback.message.chat.id) == config.admin_chat_id
+
+
+@dp.callback_query(F.data == "approve_post")
+async def cb_approve_post(callback: CallbackQuery) -> None:
+    global _pending_draft
+    if not _is_admin_callback(callback):
+        await callback.answer("Только из админ-чата")
+        return
+    if _pending_draft is None:
+        await callback.answer("Черновика уже нет — возможно, кто-то уже решил.")
+        return
+    text = _pending_draft
+    _pending_draft = None
+    try:
+        await bot.send_message(config.channel_id, text)
+        save_last_post_at(_POST_STATE_PATH, datetime.now(timezone.utc), title=_extract_title(text))
+    except Exception:
+        logger.exception("Failed to publish approved draft")
+        await callback.answer("⚠️ Не получилось опубликовать — смотри логи.", show_alert=True)
+        return
+    if callback.message:
+        await callback.message.edit_text(f"✅ Опубликовано:\n\n{text}")
+    await callback.answer("Опубликовано")
+
+
+@dp.callback_query(F.data == "reject_post")
+async def cb_reject_post(callback: CallbackQuery) -> None:
+    global _pending_draft
+    if not _is_admin_callback(callback):
+        await callback.answer("Только из админ-чата")
+        return
+    _pending_draft = None
+    if callback.message:
+        await callback.message.edit_text("🗑 Черновик пропущен — следующий будет по расписанию.")
+    await callback.answer("Пропущено")
+
+
 async def post_scheduled_content() -> None:
     while True:
+        if _effective_require_approval and _pending_draft is not None:
+            # Уже ждём решения по текущему черновику — не начинаем новый цикл
+            # генерации поверх него.
+            await asyncio.sleep(_PENDING_DRAFT_RECHECK_SECONDS)
+            continue
         # R-CONVENIENCE: если бот перезапустили вскоре после предыдущего
         # поста (деплой/краш), не постим сразу повторно — ждём остаток
         # интервала. Без этого частые рестарты выглядели бы как спам в канале.
         wait_seconds = seconds_until_next_post(_POST_STATE_PATH, config.post_interval_hours)
         if wait_seconds > 0:
             await asyncio.sleep(wait_seconds)
+            continue
         if _posting_paused:
             await asyncio.sleep(60)
             continue
         try:
-            await _publish_generated_post()
-            await asyncio.sleep(config.post_interval_hours * 3600)
+            if _effective_require_approval:
+                await _request_approval()
+                # last_post_at обновится при апруве (cb_approve_post) — тут
+                # не спим долго, следующая итерация быстро увидит pending и
+                # уйдёт в ветку выше.
+            else:
+                await _publish_generated_post()
+                await asyncio.sleep(config.post_interval_hours * 3600)
         except Exception:
             logger.exception("Failed to publish scheduled post")
             await asyncio.sleep(_RETRY_DELAY_SECONDS)

@@ -83,6 +83,12 @@ class ChannelBotConfig:
     discussion_max_replies_per_hour: int = field(
         default_factory=lambda: int(_optional("CHANNEL_DISCUSSION_MAX_REPLIES_PER_HOUR", "10"))
     )
+    # По умолчанию канал постит полностью автономно (осознанный выбор,
+    # см. README). Опционально можно включить черновик-на-ревью: перед
+    # публикацией пост уходит в admin_chat_id с кнопками "Опубликовать"/
+    # "Пропустить" вместо немедленной публикации. Без admin_chat_id эта
+    # опция бессмысленна (некуда слать черновик) — тихо игнорируется.
+    require_approval: bool = field(default_factory=lambda: _optional("CHANNEL_REQUIRE_APPROVAL", "0") == "1")
 
 
 @dataclass(frozen=True)
