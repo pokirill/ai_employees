@@ -229,6 +229,11 @@ async def handle_discussion_message(message: Message) -> None:
     text = message.text or ""
     if not text or not _should_reply(text):
         return
+    if message.from_user and message.from_user.is_bot:
+        # Защита от зацикливания: если в чате обсуждения есть другой бот
+        # (например, модераторский), два бота, отвечающие друг другу, могли
+        # бы уйти в бесконечный цикл — каждый круг стоит реальных денег.
+        return
     user_key = message.from_user.id if message.from_user else message.chat.id
     if not _discussion_limiter.allow(user_key):
         # Молча пропускаем, не отвечаем "лимит исчерпан" — в отличие от

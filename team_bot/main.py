@@ -430,6 +430,11 @@ def _mentions_bot(message: Message) -> bool:
 def _should_respond_as_assistant(message: Message) -> bool:
     if not message.text or message.text.startswith("/"):
         return False
+    if message.from_user and message.from_user.is_bot:
+        # Без этого два бота, отвечающие друг другу (наш ассистент + любой
+        # другой бот в том же чате), могли бы уйти в бесконечный цикл
+        # ответов — каждый круг это реальный оплаченный вызов LLM.
+        return False
     # Личка — всегда диалог с ассистентом, обращение по имени избыточно.
     if message.chat.type == "private":
         return True
