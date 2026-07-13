@@ -92,6 +92,35 @@ class ChannelBotConfig:
 
 
 @dataclass(frozen=True)
+class CustdevBotConfig:
+    """Отдельный, изолированный бот для реактивного кастдева в ЧУЖИХ чатах
+    (куда его вручную добавляет человек — бот не может сам вступить в
+    группу). Осознанно отдельный токен/процесс от team_bot и channel_bot:
+    если этого бота зарепортят/забанят в стороннем чате, это не должно
+    задеть репутацию/работу основных ботов проекта.
+
+    Раскрытие: бот представляется от команды «Кубышка» сразу при обращении
+    и в конце разговора явно говорит, что это приложение, даёт ссылку и
+    указывает, что ответ используется для улучшения сервиса — это НЕ
+    анонимный/скрытый сбор данных."""
+
+    telegram_token: str = field(default_factory=lambda: _require("CUSTDEV_BOT_TOKEN"))
+    # Куда пересылать содержательные ответы людей — тот же чат, что видит
+    # дайджест задач team_bot. Пусто → пересылка выключена (ответы просто
+    # логируются, команда их не увидит).
+    team_chat_id: str = field(default_factory=lambda: _optional("TEAM_CHAT_ID"))
+    # Ссылка на App Store — показывается человеку в конце разговора вместе с
+    # раскрытием, что это исследование приложения. Пусто → просто не
+    # упоминаем ссылку (не выдумываем несуществующий URL — приложение на
+    # момент написания ещё не опубликовано, см. APP_STORE_SUBMISSION.md).
+    app_store_url: str = field(default_factory=lambda: _optional("APP_STORE_URL"))
+    # R-COST: лимит реплик в час НА ЧАТ — реактивность по ключевым словам уже
+    # ограничивает частоту, это страховка от чрезмерного участия в одном
+    # особо разговорчивом про деньги чате.
+    max_replies_per_hour: int = field(default_factory=lambda: int(_optional("CUSTDEV_MAX_REPLIES_PER_HOUR", "5")))
+
+
+@dataclass(frozen=True)
 class TaskBoardConfig:
     # Мини-апп с общей доской задач — sqlite как хранилище (см. shared/task_store.py).
     db_path: str = field(default_factory=lambda: _optional("TASKS_DB_PATH", "kubyshka_tasks.db"))
