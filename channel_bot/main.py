@@ -176,6 +176,7 @@ async def _publish_generated_post() -> None:
         changelog_path=f"{config.finassist_docs_path}/AI_CHANGELOG.md",
         used_state_path=_CHANGELOG_STATE_PATH,
         docs_path=config.finassist_docs_path,
+        beta_invite_url=config.beta_invite_url,
     )
     await bot.send_message(config.channel_id, post_text)
     save_last_post_at(_POST_STATE_PATH, datetime.now(timezone.utc), title=_extract_title(post_text))
@@ -205,6 +206,7 @@ async def cmd_preview(message: Message) -> None:
             used_state_path=_CHANGELOG_STATE_PATH,
             docs_path=config.finassist_docs_path,
             dry_run=True,
+            beta_invite_url=config.beta_invite_url,
         )
     except Exception:
         logger.exception("Preview generation failed")
@@ -233,6 +235,7 @@ async def _request_approval() -> None:
         changelog_path=f"{config.finassist_docs_path}/AI_CHANGELOG.md",
         used_state_path=_CHANGELOG_STATE_PATH,
         docs_path=config.finassist_docs_path,
+        beta_invite_url=config.beta_invite_url,
     )
     _pending_draft = post_text
     await bot.send_message(
