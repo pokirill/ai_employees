@@ -10,7 +10,7 @@ from aiogram.enums import ParseMode
 from aiogram.filters import Command, CommandObject
 from aiogram.types import BotCommand, BotCommandScopeChat, CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message
 
-from channel_bot.content_generator import generate_next_post
+from channel_bot.content_generator import GeneratedPost, generate_next_post
 from channel_bot.content_queue import append_topic, load_queue, save_queue
 from channel_bot.post_state import load_last_post_info, save_last_post_at, seconds_until_next_post
 from shared.config import ChannelBotConfig, LLMConfig
@@ -53,7 +53,7 @@ _RETRY_DELAY_SECONDS = 30 * 60
 # Не персистится между рестартами — если бот перезапустят с необработанным
 # черновиком, он просто сгенерирует новый на следующем цикле, старая тема
 # из очереди уже израсходована и это ок (не критичная потеря).
-_pending_draft: str | None = None
+_pending_draft: GeneratedPost | None = None
 _PENDING_DRAFT_RECHECK_SECONDS = 5 * 60
 _effective_require_approval = config.require_approval and bool(config.admin_chat_id)
 if config.require_approval and not config.admin_chat_id:
@@ -168,9 +168,27 @@ def _extract_title(post_text: str) -> str:
     return post_text.strip().splitlines()[0][:80] if post_text.strip() else ""
 
 
+def _post_title(post: GeneratedPost) -> str:
+    return post.question[:80] if post.kind == "poll" else _extract_title(post.text)
+
+
+def _post_preview_text(post: GeneratedPost) -> str:
+    if post.kind == "poll":
+        options = "\n".join(f"▫️ {option}" for option in post.options)
+        return f"📊 <b>Опрос</b>\n{post.question}\n\n{options}"
+    return post.text
+
+
+async def _send_generated_post(chat_id: str, post: GeneratedPost) -> None:
+    if post.kind == "poll":
+        await bot.send_poll(chat_id, post.question, post.options, is_anonymous=True)
+    else:
+        await bot.send_message(chat_id, post.text)
+
+
 async def _publish_generated_post() -> None:
     sync_docs_repo(config.finassist_docs_path)
-    post_text = generate_next_post(
+    post = generate_next_post(
         llm,
         queue_path=_QUEUE_PATH,
         changelog_path=f"{config.finassist_docs_path}/AI_CHANGELOG.md",
@@ -178,8 +196,8 @@ async def _publish_generated_post() -> None:
         docs_path=config.finassist_docs_path,
         beta_invite_url=config.beta_invite_url,
     )
-    await bot.send_message(config.channel_id, post_text)
-    save_last_post_at(_POST_STATE_PATH, datetime.now(timezone.utc), title=_extract_title(post_text))
+    await _send_generated_post(config.channel_id, post)
+    save_last_post_at(_POST_STATE_PATH, datetime.now(timezone.utc), title=_post_title(post))
 
 
 @dp.message(Command("postnow"), F.func(_admin_filter))
@@ -199,7 +217,7 @@ async def cmd_preview(message: Message) -> None:
     await message.answer("Генерирую предпросмотр (очередь/changelog не тронуты)…")
     try:
         sync_docs_repo(config.finassist_docs_path)
-        preview_text = generate_next_post(
+        preview_post = generate_next_post(
             llm,
             queue_path=_QUEUE_PATH,
             changelog_path=f"{config.finassist_docs_path}/AI_CHANGELOG.md",
@@ -212,7 +230,7 @@ async def cmd_preview(message: Message) -> None:
         logger.exception("Preview generation failed")
         await message.answer("⚠️ Не получилось сгенерировать предпросмотр.")
         return
-    await message.answer(f"👀 <b>Предпросмотр следующего поста:</b>\n\n{preview_text}")
+    await message.answer(f"👀 <b>Предпросмотр следующего поста:</b>\n\n{_post_preview_text(preview_post)}")
 
 
 def _approval_keyboard() -> InlineKeyboardMarkup:
@@ -229,7 +247,7 @@ def _approval_keyboard() -> InlineKeyboardMarkup:
 async def _request_approval() -> None:
     global _pending_draft
     sync_docs_repo(config.finassist_docs_path)
-    post_text = generate_next_post(
+    post = generate_next_post(
         llm,
         queue_path=_QUEUE_PATH,
         changelog_path=f"{config.finassist_docs_path}/AI_CHANGELOG.md",
@@ -237,9 +255,11 @@ async def _request_approval() -> None:
         docs_path=config.finassist_docs_path,
         beta_invite_url=config.beta_invite_url,
     )
-    _pending_draft = post_text
+    _pending_draft = post
     await bot.send_message(
-        config.admin_chat_id, f"👀 <b>Черновик поста — нужно решение:</b>\n\n{post_text}", reply_markup=_approval_keyboard()
+        config.admin_chat_id,
+        f"👀 <b>Черновик поста — нужно решение:</b>\n\n{_post_preview_text(post)}",
+        reply_markup=_approval_keyboard(),
     )
 
 
@@ -256,17 +276,17 @@ async def cb_approve_post(callback: CallbackQuery) -> None:
     if _pending_draft is None:
         await callback.answer("Черновика уже нет — возможно, кто-то уже решил.")
         return
-    text = _pending_draft
+    post = _pending_draft
     _pending_draft = None
     try:
-        await bot.send_message(config.channel_id, text)
-        save_last_post_at(_POST_STATE_PATH, datetime.now(timezone.utc), title=_extract_title(text))
+        await _send_generated_post(config.channel_id, post)
+        save_last_post_at(_POST_STATE_PATH, datetime.now(timezone.utc), title=_post_title(post))
     except Exception:
         logger.exception("Failed to publish approved draft")
         await callback.answer("⚠️ Не получилось опубликовать — смотри логи.", show_alert=True)
         return
     if callback.message:
-        await callback.message.edit_text(f"✅ Опубликовано:\n\n{text}")
+        await callback.message.edit_text(f"✅ Опубликовано:\n\n{_post_preview_text(post)}")
     await callback.answer("Опубликовано")
 
 
