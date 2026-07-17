@@ -57,3 +57,19 @@ def test_escapes_html_in_titles():
 
     assert "<script>" not in digest
     assert "&lt;script&gt;" in digest
+
+
+def test_success_rate_computed_from_done_and_cancelled():
+    done = [_task(id=1), _task(id=2), _task(id=3)]
+    cancelled = [_task(id=4, status="cancelled")]
+    still_open = [_task(id=5)]
+
+    digest = build_sprint_digest(done, cancelled, still_open, period_label="07.07-13.07")
+
+    assert "📈 Доля выполненных из закрытых: 75% (3/4)" in digest
+
+
+def test_success_rate_shows_placeholder_when_nothing_closed_yet():
+    digest = build_sprint_digest([], [], [_task(title="Открыто")], period_label="07.07-13.07")
+
+    assert "📈 Доля выполненных из закрытых: — (пока нет закрытых задач)" in digest
