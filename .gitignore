@@ -3,6 +3,7 @@
 __pycache__/
 *.pyc
 channel_bot/topics_queue.json
+channel_bot/story_topics_queue.json
 channel_bot/used_changelog_titles.json
 channel_bot/last_post_state.json
 *.db

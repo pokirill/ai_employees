@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 from aiogram import Bot, Dispatcher, F
 from aiogram.client.default import DefaultBotProperties
@@ -10,9 +10,9 @@ from aiogram.enums import ParseMode
 from aiogram.filters import Command, CommandObject
 from aiogram.types import BotCommand, BotCommandScopeChat, CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message
 
-from channel_bot.content_generator import GeneratedPost, generate_next_post, revise_post
+from channel_bot.content_generator import GeneratedPost, generate_next_post, generate_post_for_category, revise_post
 from channel_bot.content_queue import append_topic, load_queue, save_queue
-from channel_bot.post_state import load_last_post_info, save_last_post_at, seconds_until_next_post
+from channel_bot.post_state import load_last_post_info, save_last_post_at
 from shared.config import ChannelBotConfig, LLMConfig
 from shared.docs_context import load_project_context, sync_docs_repo
 from shared.llm_client import LLMClient
@@ -28,8 +28,37 @@ bot = Bot(token=config.telegram_token, default=DefaultBotProperties(parse_mode=P
 dp = Dispatcher()
 
 _QUEUE_PATH = "channel_bot/topics_queue.json"
+_STORY_QUEUE_PATH = "channel_bot/story_topics_queue.json"
 _CHANGELOG_STATE_PATH = "channel_bot/used_changelog_titles.json"
 _POST_STATE_PATH = "channel_bot/last_post_state.json"
+
+# По просьбе — 2-3 поста в день с ЗАКРЕПЛЁННОЙ темой на слот вместо случайного
+# формата каждый раз (было: 1 пост/сутки, формат — рулетка). Время — МСК,
+# час дня выбран по общей практике для лайфстайл/финансового контента (утро —
+# лёгкое вовлечение, обед — основной продуктовый контент, вечер — самое
+# активное время для реакций/комментариев). Список отсортирован по времени
+# суток — см. _next_slot_datetime, порядок важен.
+_DAILY_SLOTS: list[tuple[int, int, str]] = [
+    (10, 0, "poll"),
+    (14, 30, "feature"),
+    (19, 30, "personal"),
+]
+_CATEGORY_LABELS = {"poll": "опрос", "feature": "про фичу", "personal": "личная история"}
+# Россия не переходит на летнее время — фиксированный оффсет ок, без tzdata.
+_MSK_OFFSET_HOURS = 3
+
+
+def _next_slot_datetime(now_utc: datetime) -> tuple[datetime, str]:
+    """Ближайший следующий слот (строго после now_utc) из _DAILY_SLOTS —
+    сегодняшний, если ещё не наступил, иначе первый слот следующих суток."""
+    for day_offset in (0, 1):
+        day = now_utc + timedelta(days=day_offset)
+        for hour_msk, minute_msk, category in _DAILY_SLOTS:
+            slot_dt = day.replace(hour=hour_msk - _MSK_OFFSET_HOURS, minute=minute_msk, second=0, microsecond=0)
+            if day_offset == 0 and slot_dt <= now_utc:
+                continue
+            return slot_dt, category
+    raise AssertionError("unreachable — _DAILY_SLOTS должен быть непустым")
 
 # R-COST: см. shared/rate_limiter.py — защита от одного спамящего "?" в
 # публичном чате обсуждения. По пользователю, не по чату целиком (иначе
@@ -63,6 +92,11 @@ _pending_photo: str | None = None
 # сообщением админа — следующее текстовое сообщение в админ-чате трактуется
 # как правка к _pending_draft, а не игнорируется (см. handle_admin_feedback).
 _awaiting_feedback: bool = False
+# Тема слота (см. _DAILY_SLOTS), из которого получен текущий черновик — None
+# для ручного /postnow и /preview без аргумента (свободный формат). Нужна,
+# чтобы реролл («🔄 Новый пост») пересоздавал черновик С ТОЙ ЖЕ темой слота,
+# а не случайным форматом.
+_pending_slot_category: str | None = None
 _PENDING_DRAFT_RECHECK_SECONDS = 5 * 60
 _effective_require_approval = config.require_approval and bool(config.admin_chat_id)
 if config.require_approval and not config.admin_chat_id:
@@ -132,11 +166,53 @@ async def cmd_removetopic(message: Message, command: CommandObject) -> None:
     await message.answer(f"🗑 Удалил из очереди: «{removed}»")
 
 
+@dp.message(Command("addstory"), F.func(_admin_filter))
+async def cmd_addstory(message: Message, command: CommandObject) -> None:
+    # R-COST: отдельная очередь, не /addtopic — вечерний слот (см.
+    # _DAILY_SLOTS) берёт тему ТОЛЬКО отсюда, чтобы не выдумывать личную
+    # историю самостоятельно (см. generate_post_for_category).
+    story = (command.args or "").strip()
+    if not story:
+        await message.answer("Формат: /addstory реальная история или наблюдение из жизни для личного поста")
+        return
+    append_topic(_STORY_QUEUE_PATH, story)
+    await message.answer(f"✅ Добавил в очередь личных историй: «{story}»")
+
+
+@dp.message(Command("stories"), F.func(_admin_filter))
+async def cmd_stories(message: Message) -> None:
+    stories = load_queue(_STORY_QUEUE_PATH)
+    if not stories:
+        await message.answer(
+            "Очередь личных историй пуста — вечерний слот пока будет заменяться постом про фичу. Добавь через /addstory."
+        )
+        return
+    lines = [f"{i}. {s}" for i, s in enumerate(stories, start=1)]
+    await message.answer("Очередь личных историй:\n" + "\n".join(lines) + "\n\nУдалить: /removestory <номер>")
+
+
+@dp.message(Command("removestory"), F.func(_admin_filter))
+async def cmd_removestory(message: Message, command: CommandObject) -> None:
+    arg = (command.args or "").strip()
+    if not arg.isdigit():
+        await message.answer("Формат: /removestory 2 (номер из /stories)")
+        return
+    stories = load_queue(_STORY_QUEUE_PATH)
+    index = int(arg) - 1
+    if not (0 <= index < len(stories)):
+        await message.answer("Такого номера нет — посмотри /stories.")
+        return
+    removed = stories.pop(index)
+    save_queue(_STORY_QUEUE_PATH, stories)
+    await message.answer(f"🗑 Удалил из очереди историй: «{removed}»")
+
+
 @dp.message(Command("status"), F.func(_admin_filter))
 async def cmd_status(message: Message) -> None:
     topics_count = len(load_queue(_QUEUE_PATH))
-    remaining = seconds_until_next_post(_POST_STATE_PATH, config.post_interval_hours)
-    hours_left = round(remaining / 3600, 1)
+    stories_count = len(load_queue(_STORY_QUEUE_PATH))
+    next_slot_dt, next_category = _next_slot_datetime(datetime.now(timezone.utc))
+    next_slot_msk = next_slot_dt + timedelta(hours=_MSK_OFFSET_HOURS)
     last_info = load_last_post_info(_POST_STATE_PATH)
     if last_info:
         ago_hours = round((datetime.now(timezone.utc) - last_info["last_post_at"]).total_seconds() / 3600, 1)
@@ -155,9 +231,8 @@ async def cmd_status(message: Message) -> None:
         f"{'⏸ Автопостинг на паузе (/resume)' if _posting_paused else '▶️ Автопостинг активен'}\n"
         f"{mode_line}\n"
         f"{last_line}\n"
-        f"📋 Тем в очереди: {topics_count}\n"
-        f"⏰ Интервал постинга: {config.post_interval_hours} ч\n"
-        f"⏳ До следующего автопоста: ~{hours_left} ч\n"
+        f"📋 Тем в очереди: {topics_count} | 📔 личных историй в очереди: {stories_count}\n"
+        f"⏰ Следующий слот: {_CATEGORY_LABELS.get(next_category, next_category)} в {next_slot_msk:%H:%M} МСК\n"
         f"💬 Ответы в обсуждении: {'включены' if config.discussion_chat_id else 'выключены (DISCUSSION_CHAT_ID не задан)'}"
     )
 
@@ -203,25 +278,54 @@ async def _send_generated_post(chat_id: str, post: GeneratedPost, photo: str | N
         await bot.send_message(chat_id, post.text)
 
 
-async def _publish_generated_post() -> None:
-    sync_docs_repo(config.finassist_docs_path)
-    post = generate_next_post(
+def _generate_post_for_slot(category: str | None, *, dry_run: bool = False) -> GeneratedPost:
+    """category=None — свободный формат (ручной /postnow и /preview без
+    аргумента). Иначе — тема слота расписания (см. _DAILY_SLOTS); для
+    category="personal" с пустой очередью историй тихо подменяет на
+    category="feature", а не выдумывает историю (см. generate_post_for_category)."""
+    if category is None:
+        return generate_next_post(
+            llm,
+            queue_path=_QUEUE_PATH,
+            changelog_path=f"{config.finassist_docs_path}/AI_CHANGELOG.md",
+            used_state_path=_CHANGELOG_STATE_PATH,
+            docs_path=config.finassist_docs_path,
+            dry_run=dry_run,
+            beta_invite_url=config.beta_invite_url,
+        )
+    post = generate_post_for_category(
         llm,
+        category,
         queue_path=_QUEUE_PATH,
+        story_queue_path=_STORY_QUEUE_PATH,
         changelog_path=f"{config.finassist_docs_path}/AI_CHANGELOG.md",
         used_state_path=_CHANGELOG_STATE_PATH,
         docs_path=config.finassist_docs_path,
+        dry_run=dry_run,
         beta_invite_url=config.beta_invite_url,
     )
+    if post is None:
+        logger.info("Story queue empty for 'personal' slot — falling back to 'feature' category")
+        return _generate_post_for_slot("feature", dry_run=dry_run)
+    return post
+
+
+async def _publish_generated_post(category: str | None = None) -> None:
+    sync_docs_repo(config.finassist_docs_path)
+    post = _generate_post_for_slot(category)
     await _send_generated_post(config.channel_id, post)
     save_last_post_at(_POST_STATE_PATH, datetime.now(timezone.utc), title=_post_title(post))
 
 
 @dp.message(Command("postnow"), F.func(_admin_filter))
-async def cmd_postnow(message: Message) -> None:
+async def cmd_postnow(message: Message, command: CommandObject) -> None:
+    category = (command.args or "").strip().lower() or None
+    if category and category not in _CATEGORY_LABELS:
+        await message.answer(f"Неизвестная тема «{category}». Форматы: /postnow [poll|feature|personal]")
+        return
     await message.answer("Публикую…")
     try:
-        await _publish_generated_post()
+        await _publish_generated_post(category=category)
     except Exception:
         logger.exception("Manual post failed")
         await message.answer("⚠️ Не получилось опубликовать — смотри логи бота.")
@@ -230,19 +334,15 @@ async def cmd_postnow(message: Message) -> None:
 
 
 @dp.message(Command("preview"), F.func(_admin_filter))
-async def cmd_preview(message: Message) -> None:
+async def cmd_preview(message: Message, command: CommandObject) -> None:
+    category = (command.args or "").strip().lower() or None
+    if category and category not in _CATEGORY_LABELS:
+        await message.answer(f"Неизвестная тема «{category}». Форматы: /preview [poll|feature|personal]")
+        return
     await message.answer("Генерирую предпросмотр (очередь/changelog не тронуты)…")
     try:
         sync_docs_repo(config.finassist_docs_path)
-        preview_post = generate_next_post(
-            llm,
-            queue_path=_QUEUE_PATH,
-            changelog_path=f"{config.finassist_docs_path}/AI_CHANGELOG.md",
-            used_state_path=_CHANGELOG_STATE_PATH,
-            docs_path=config.finassist_docs_path,
-            dry_run=True,
-            beta_invite_url=config.beta_invite_url,
-        )
+        preview_post = _generate_post_for_slot(category, dry_run=True)
     except Exception:
         logger.exception("Preview generation failed")
         await message.answer("⚠️ Не получилось сгенерировать предпросмотр.")
@@ -272,24 +372,19 @@ def _reject_followup_keyboard() -> InlineKeyboardMarkup:
     )
 
 
-async def _request_approval() -> None:
-    global _pending_draft, _pending_photo, _awaiting_feedback
+async def _request_approval(category: str | None = None) -> None:
+    global _pending_draft, _pending_photo, _awaiting_feedback, _pending_slot_category
     sync_docs_repo(config.finassist_docs_path)
-    post = generate_next_post(
-        llm,
-        queue_path=_QUEUE_PATH,
-        changelog_path=f"{config.finassist_docs_path}/AI_CHANGELOG.md",
-        used_state_path=_CHANGELOG_STATE_PATH,
-        docs_path=config.finassist_docs_path,
-        beta_invite_url=config.beta_invite_url,
-    )
+    post = _generate_post_for_slot(category)
     _pending_draft = post
     _pending_photo = None
     _awaiting_feedback = False
+    _pending_slot_category = category
+    category_hint = f" ({_CATEGORY_LABELS[category]})" if category else ""
     photo_hint = "\n\n📎 Пришли мне фото, если хочешь прикрепить его к посту." if post.kind == "text" else ""
     await bot.send_message(
         config.admin_chat_id,
-        f"👀 <b>Черновик поста — нужно решение:</b>\n\n{_post_preview_text(post)}{photo_hint}",
+        f"👀 <b>Черновик поста{category_hint} — нужно решение:</b>\n\n{_post_preview_text(post)}{photo_hint}",
         reply_markup=_approval_keyboard(),
     )
 
@@ -364,6 +459,10 @@ async def cb_reroll_post(callback: CallbackQuery) -> None:
     if not _is_admin_callback(callback):
         await callback.answer("Только из админ-чата")
         return
+    # Реролл сохраняет тему СЛОТА (см. _pending_slot_category) — если это был
+    # вечерний "personal"-слот, новый вариант тоже должен быть личной
+    # историей (или fallback на фичу), а не случайным форматом.
+    category = _pending_slot_category
     _pending_draft = None
     _pending_photo = None
     _awaiting_feedback = False
@@ -371,7 +470,7 @@ async def cb_reroll_post(callback: CallbackQuery) -> None:
         await callback.message.edit_text("🔄 Черновик пропущен — готовлю другой вариант…")
     await callback.answer("Готовлю новый вариант")
     try:
-        await _request_approval()
+        await _request_approval(category=category)
     except Exception:
         logger.exception("Failed to generate replacement draft after reroll")
         await bot.send_message(
@@ -434,25 +533,27 @@ async def post_scheduled_content() -> None:
             # генерации поверх него.
             await asyncio.sleep(_PENDING_DRAFT_RECHECK_SECONDS)
             continue
-        # R-CONVENIENCE: если бот перезапустили вскоре после предыдущего
-        # поста (деплой/краш), не постим сразу повторно — ждём остаток
-        # интервала. Без этого частые рестарты выглядели бы как спам в канале.
-        wait_seconds = seconds_until_next_post(_POST_STATE_PATH, config.post_interval_hours)
-        if wait_seconds > 0:
-            await asyncio.sleep(wait_seconds)
-            continue
         if _posting_paused:
             await asyncio.sleep(60)
             continue
+        # R-CONVENIENCE: расписание чисто по времени суток (_DAILY_SLOTS), не
+        # "N часов после последнего поста" — если бот перезапустили и слот
+        # уже прошёл, он просто пропускается (не постим задним числом), тот
+        # же принцип, что раньше давал избежать спама после рестарта.
+        now = datetime.now(timezone.utc)
+        slot_dt, category = _next_slot_datetime(now)
+        wait_seconds = (slot_dt - now).total_seconds()
+        if wait_seconds > 0:
+            await asyncio.sleep(min(wait_seconds, _PENDING_DRAFT_RECHECK_SECONDS))
+            continue
         try:
             if _effective_require_approval:
-                await _request_approval()
+                await _request_approval(category=category)
                 # last_post_at обновится при апруве (cb_approve_post) — тут
                 # не спим долго, следующая итерация быстро увидит pending и
                 # уйдёт в ветку выше.
             else:
-                await _publish_generated_post()
-                await asyncio.sleep(config.post_interval_hours * 3600)
+                await _publish_generated_post(category=category)
         except Exception:
             logger.exception("Failed to publish scheduled post")
             await asyncio.sleep(_RETRY_DELAY_SECONDS)
@@ -511,8 +612,11 @@ _ADMIN_COMMANDS = _DEFAULT_COMMANDS + [
     BotCommand(command="addtopic", description="Добавить тему в очередь"),
     BotCommand(command="queue", description="Очередь тем"),
     BotCommand(command="removetopic", description="Удалить тему из очереди"),
-    BotCommand(command="preview", description="Предпросмотр следующего поста"),
-    BotCommand(command="postnow", description="Опубликовать сейчас"),
+    BotCommand(command="addstory", description="Добавить личную историю в очередь"),
+    BotCommand(command="stories", description="Очередь личных историй"),
+    BotCommand(command="removestory", description="Удалить историю из очереди"),
+    BotCommand(command="preview", description="Предпросмотр (можно: poll/feature/personal)"),
+    BotCommand(command="postnow", description="Опубликовать сейчас (можно: poll/feature/personal)"),
     BotCommand(command="pause", description="Приостановить автопостинг"),
     BotCommand(command="resume", description="Возобновить автопостинг"),
     BotCommand(command="status", description="Статус бота"),

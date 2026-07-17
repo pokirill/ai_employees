@@ -41,10 +41,15 @@ _SYSTEM_PROMPT = (
     "что в «Кубышке» есть функция, которая именно эту проблему решает, в виде "
     "юзкейса («теперь можно X»), без тикетов и технических терминов.\n"
     "— Если тема — личная история, наблюдение или случай из жизни (не "
-    "привязанные к конкретной функции): просто напиши живой личный текст от "
-    "первого лица, как дневниковую запись, — НЕ нужно искусственно "
-    "приплетать функцию приложения, если сама тема этого не просит. Такие "
-    "посты держат канал живым, не только рекламным.\n"
+    "привязанные к конкретной функции): если в теме описан конкретный "
+    "реальный случай — пиши от первого лица, как дневниковую запись; если "
+    "тема — общее поведенческое наблюдение о деньгах без конкретного случая "
+    "(забытые подписки, траты по умолчанию, недостигнутое чувство от уже "
+    "достигнутой цели и т.п.) — пиши в форме «а вы замечали, что...», не "
+    "выдумывая от себя конкретный вымышленный случай как будто он реально "
+    "произошёл. НЕ нужно искусственно приплетать функцию приложения, если "
+    "сама тема этого не просит. Такие посты держат канал живым, не только "
+    "рекламным.\n"
     "НИКОГДА не упоминай внутреннюю механику удержания/уведомлений — "
     "«стрик», «риск стрика», алгоритмы пушей, антиотточные механизмы и "
     "подобное. Это не то, о чём должен знать читатель, даже переформулированное. "
@@ -62,12 +67,18 @@ _SYSTEM_PROMPT = (
     "избегай канцелярита и сложных слов. Иногда (не в каждом посте) можно "
     "по-доброму назвать читателей необычным, тёплым прозвищем в духе "
     "«кубышкины» — так, как больше никто не называет.\n"
-    "Шутки мягкие, без сарказма и без осуждения читателя. Начни с короткой "
+    "Шутки мягкие, без сарказма и без осуждения читателя (осуждать/подкалывать "
+    "можно только себя саму как канал или воображаемого смм-щика «Кубышки» — "
+    "так шутит Авиасейлс, читателя это не касается). Начни с короткой "
     "цепляющей строки-заголовка (эмодзи уместны) прямо в тексте поста, без "
     "префикса — но не всегда одним и тем же приёмом: чередуй разоблачение "
     "расхожего мнения, риторический вопрос, бытовую реплику/диалог, честное "
-    "признание своей мелкой слабости, сравнение через понятную метафору. Не "
-    "начинай пост с «Знаете ли вы...» — это заезженный, раздражающий зачин.\n"
+    "признание своей мелкой слабости, сравнение через понятную метафору, а "
+    "иногда — весёлое абсурдное преувеличение или неожиданное сравнение (в "
+    "духе Авиасейлс), если тема это позволяет. Не начинай пост с «Знаете ли "
+    "вы...» — это заезженный, раздражающий зачин.\n"
+    "Не пиши скучно и сухо, как техническое объявление для разработчиков, — "
+    "живой пост важнее, чем точный и полный пересказ изменения.\n"
     "После того как раскрыл фичу — не разжёвывай её длинным комментарием "
     "дальше, дай ей «говорить самой за себя» и закругляйся.\n"
     "НИКОГДА не используй эти клише и похожие на них по духу фразы: «по цене "
@@ -222,6 +233,9 @@ def _next_public_changelog_entry(
     return None
 
 
+_VALID_SLOT_CATEGORIES = ("poll", "feature", "personal")
+
+
 def _write_poll(llm: LLMClient, topic: str) -> GeneratedPost | None:
     raw = llm.chat(
         [
@@ -264,8 +278,13 @@ def revise_post(llm: LLMClient, original: GeneratedPost, feedback: str) -> Gener
     return GeneratedPost(kind="text", text=text)
 
 
-def _generate_post(llm: LLMClient, topic: str, beta_invite_url: str = "") -> GeneratedPost:
-    if random.random() < _POLL_PROBABILITY:
+def _generate_post(llm: LLMClient, topic: str, beta_invite_url: str = "", force_kind: str | None = None) -> GeneratedPost:
+    """force_kind=None — старое вероятностное поведение (см. _POLL_PROBABILITY,
+    для необязательного /postnow и /preview). force_kind="poll"/"text" — для
+    именованных слотов расписания (см. generate_post_for_category), где формат
+    поста задаётся местом в расписании, а не случайностью."""
+    wants_poll = force_kind == "poll" or (force_kind is None and random.random() < _POLL_PROBABILITY)
+    if wants_poll:
         poll = _write_poll(llm, topic)
         if poll is not None:
             return poll
@@ -281,6 +300,36 @@ def _generate_post(llm: LLMClient, topic: str, beta_invite_url: str = "") -> Gen
     return GeneratedPost(kind="text", text=text + _maybe_beta_invite(beta_invite_url))
 
 
+def _next_feature_topic(
+    llm: LLMClient, queue_path: str, changelog_path: str, used_state_path: str, docs_path: str, *, dry_run: bool
+) -> tuple[str, bool]:
+    """Тема для фичи-поста: очередь → changelog → тема сочиняется по общему
+    контексту проекта. Второй элемент — has_specific_topic: False только в
+    последнем случае, когда очередь и changelog исчерпаны — на такой теме
+    осознанно не форсируем опрос (см. вызывающий код), вопрос вышел бы
+    слишком общим без конкретной темы."""
+    topic = peek_next_topic(queue_path) if dry_run else pop_next_topic(queue_path)
+    if topic:
+        return topic, True
+
+    entry = _next_public_changelog_entry(llm, changelog_path, used_state_path, dry_run=dry_run)
+    if entry:
+        if not dry_run:
+            mark_title_used(used_state_path, entry["title"])
+        return f"{entry['title']}\n\n{entry['body']}", True
+
+    # R-COST: очередь и changelog исчерпаны — просим модель самой выбрать тему
+    # по контексту проекта, тем же системным промптом, что и обычная
+    # генерация по теме (один вызов LLM, не два).
+    context = load_project_context(docs_path, max_chars=6000)
+    topic = (
+        "Очередь тем и записи AI_CHANGELOG.md закончились — выбери сама "
+        "интересную тему по контексту проекта ниже и сразу напиши пост по ней "
+        f"(без промежуточного описания темы).\n\nКонтекст проекта:\n{context}"
+    )
+    return topic, False
+
+
 def generate_next_post(
     llm: LLMClient,
     *,
@@ -293,37 +342,42 @@ def generate_next_post(
 ) -> GeneratedPost:
     """dry_run=True — для /preview: генерирует текст, НЕ трогая состояние
     (не выкидывает тему из очереди, не помечает запись changelog
-    использованной), чтобы предпросмотр не "тратил" реальный контент."""
-    topic = peek_next_topic(queue_path) if dry_run else pop_next_topic(queue_path)
-    if topic:
-        return _generate_post(llm, topic, beta_invite_url)
+    использованной), чтобы предпросмотр не "тратил" реальный контент.
+    Свободный формат (без привязки к теме слота расписания) — см.
+    generate_post_for_category для расписания с фиксированной темой на слот."""
+    topic, has_specific_topic = _next_feature_topic(llm, queue_path, changelog_path, used_state_path, docs_path, dry_run=dry_run)
+    force_kind = None if has_specific_topic else "text"
+    return _generate_post(llm, topic, beta_invite_url, force_kind=force_kind)
 
-    entry = _next_public_changelog_entry(llm, changelog_path, used_state_path, dry_run=dry_run)
-    if entry:
-        if not dry_run:
-            mark_title_used(used_state_path, entry["title"])
-        topic = f"{entry['title']}\n\n{entry['body']}"
-        return _generate_post(llm, topic, beta_invite_url)
 
-    # R-COST: очередь и changelog исчерпаны — раньше тут было 2 вызова LLM
-    # (сначала "придумай тему", потом отдельно "напиши пост по теме"), хотя
-    # это один и тот же контекст проекта дважды в токенах. Одним вызовом —
-    # просим модель самой выбрать тему и сразу написать пост, тем же
-    # системным промптом, что и обычная генерация по теме. Опрос в этой ветке
-    # намеренно не делаем — без конкретной темы вопрос вышел бы слишком общим.
-    context = load_project_context(docs_path, max_chars=6000)
-    text = llm.chat(
-        [
-            {"role": "system", "content": _SYSTEM_PROMPT},
-            {
-                "role": "user",
-                "content": (
-                    "Очередь тем и записи AI_CHANGELOG.md закончились — выбери сама "
-                    "интересную тему по контексту проекта ниже и сразу напиши пост "
-                    f"по ней (без промежуточного описания темы).\n\nКонтекст проекта:\n{context}"
-                ),
-            },
-        ],
-        max_tokens=_POST_MAX_TOKENS,
-    )
-    return GeneratedPost(kind="text", text=text + _maybe_beta_invite(beta_invite_url))
+def generate_post_for_category(
+    llm: LLMClient,
+    category: str,
+    *,
+    queue_path: str,
+    story_queue_path: str,
+    changelog_path: str,
+    used_state_path: str,
+    docs_path: str,
+    dry_run: bool = False,
+    beta_invite_url: str = "",
+) -> GeneratedPost | None:
+    """Для расписания с закреплённой темой на слот (см. main.py/_DAILY_SLOTS):
+    category="feature" — обычный проблема→фича текст; category="poll" — тот
+    же источник тем, но форсированный опрос; category="personal" — тема
+    берётся ТОЛЬКО из отдельной очереди реальных историй (story_queue_path,
+    см. /addstory) — вернёт None, если она пуста, а не выдумает историю;
+    вызывающий код сам решает, чем заменить пустой слот."""
+    if category not in _VALID_SLOT_CATEGORIES:
+        raise ValueError(f"unknown slot category: {category!r}")
+
+    if category == "personal":
+        topic = peek_next_topic(story_queue_path) if dry_run else pop_next_topic(story_queue_path)
+        if not topic:
+            return None
+        return _generate_post(llm, topic, beta_invite_url, force_kind="text")
+
+    topic, has_specific_topic = _next_feature_topic(llm, queue_path, changelog_path, used_state_path, docs_path, dry_run=dry_run)
+    if category == "poll" and has_specific_topic:
+        return _generate_post(llm, topic, beta_invite_url, force_kind="poll")
+    return _generate_post(llm, topic, beta_invite_url, force_kind="text")
