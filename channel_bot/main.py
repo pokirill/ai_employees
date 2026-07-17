@@ -12,6 +12,7 @@ from aiogram.types import BotCommand, BotCommandScopeChat, CallbackQuery, Inline
 
 from channel_bot.content_generator import GeneratedPost, generate_next_post, generate_post_for_category, revise_post
 from channel_bot.content_queue import append_topic, load_queue, save_queue
+from channel_bot.feedback_store import add_feedback, load_feedback, remove_feedback
 from channel_bot.post_state import load_last_post_info, save_last_post_at
 from shared.config import ChannelBotConfig, LLMConfig
 from shared.docs_context import load_project_context, sync_docs_repo
@@ -31,6 +32,7 @@ _QUEUE_PATH = "channel_bot/topics_queue.json"
 _STORY_QUEUE_PATH = "channel_bot/story_topics_queue.json"
 _CHANGELOG_STATE_PATH = "channel_bot/used_changelog_titles.json"
 _POST_STATE_PATH = "channel_bot/last_post_state.json"
+_FEEDBACK_PATH = "channel_bot/feedback_log.json"
 
 # По просьбе — 2-3 поста в день с ЗАКРЕПЛЁННОЙ темой на слот вместо случайного
 # формата каждый раз (было: 1 пост/сутки, формат — рулетка). Время — МСК,
@@ -207,10 +209,47 @@ async def cmd_removestory(message: Message, command: CommandObject) -> None:
     await message.answer(f"🗑 Удалил из очереди историй: «{removed}»")
 
 
+@dp.message(Command("feedback"), F.func(_admin_filter))
+async def cmd_feedback(message: Message, command: CommandObject) -> None:
+    # R-CONVENIENCE: в отличие от кнопки "Предложить правки" (которая правит
+    # ОДИН конкретный черновик), это можно отправить в любой момент, без
+    # привязки к текущему посту — общее замечание по стилю на будущее.
+    text = (command.args or "").strip()
+    if not text:
+        await message.answer("Формат: /feedback как хочешь, чтобы посты писались иначе — учту во всех следующих")
+        return
+    add_feedback(_FEEDBACK_PATH, text)
+    await message.answer("✅ Запомнил, буду учитывать в следующих постах. /feedbacklist — посмотреть все.")
+
+
+@dp.message(Command("feedbacklist"), F.func(_admin_filter))
+async def cmd_feedbacklist(message: Message) -> None:
+    notes = load_feedback(_FEEDBACK_PATH)
+    if not notes:
+        await message.answer("Замечаний пока нет — добавь через /feedback.")
+        return
+    lines = [f"{i}. {n}" for i, n in enumerate(notes, start=1)]
+    await message.answer("Замечания, которые учитываются в постах:\n" + "\n".join(lines) + "\n\nУдалить: /removefeedback <номер>")
+
+
+@dp.message(Command("removefeedback"), F.func(_admin_filter))
+async def cmd_removefeedback(message: Message, command: CommandObject) -> None:
+    arg = (command.args or "").strip()
+    if not arg.isdigit():
+        await message.answer("Формат: /removefeedback 2 (номер из /feedbacklist)")
+        return
+    removed = remove_feedback(_FEEDBACK_PATH, int(arg) - 1)
+    if removed is None:
+        await message.answer("Такого номера нет — посмотри /feedbacklist.")
+        return
+    await message.answer(f"🗑 Удалил замечание: «{removed}»")
+
+
 @dp.message(Command("status"), F.func(_admin_filter))
 async def cmd_status(message: Message) -> None:
     topics_count = len(load_queue(_QUEUE_PATH))
     stories_count = len(load_queue(_STORY_QUEUE_PATH))
+    feedback_count = len(load_feedback(_FEEDBACK_PATH))
     next_slot_dt, next_category = _next_slot_datetime(datetime.now(timezone.utc))
     next_slot_msk = next_slot_dt + timedelta(hours=_MSK_OFFSET_HOURS)
     last_info = load_last_post_info(_POST_STATE_PATH)
@@ -231,7 +270,7 @@ async def cmd_status(message: Message) -> None:
         f"{'⏸ Автопостинг на паузе (/resume)' if _posting_paused else '▶️ Автопостинг активен'}\n"
         f"{mode_line}\n"
         f"{last_line}\n"
-        f"📋 Тем в очереди: {topics_count} | 📔 личных историй в очереди: {stories_count}\n"
+        f"📋 Тем в очереди: {topics_count} | 📔 личных историй: {stories_count} | 🗒 замечаний: {feedback_count}\n"
         f"⏰ Следующий слот: {_CATEGORY_LABELS.get(next_category, next_category)} в {next_slot_msk:%H:%M} МСК\n"
         f"💬 Ответы в обсуждении: {'включены' if config.discussion_chat_id else 'выключены (DISCUSSION_CHAT_ID не задан)'}"
     )
@@ -292,6 +331,7 @@ def _generate_post_for_slot(category: str | None, *, dry_run: bool = False) -> G
             docs_path=config.finassist_docs_path,
             dry_run=dry_run,
             beta_invite_url=config.beta_invite_url,
+            feedback_path=_FEEDBACK_PATH,
         )
     post = generate_post_for_category(
         llm,
@@ -303,6 +343,7 @@ def _generate_post_for_slot(category: str | None, *, dry_run: bool = False) -> G
         docs_path=config.finassist_docs_path,
         dry_run=dry_run,
         beta_invite_url=config.beta_invite_url,
+        feedback_path=_FEEDBACK_PATH,
     )
     if post is None:
         logger.info("Story queue empty for 'personal' slot — falling back to 'feature' category")
@@ -514,14 +555,19 @@ async def handle_admin_feedback(message: Message) -> None:
     _awaiting_feedback = False
     await bot.send_chat_action(message.chat.id, "typing")
     try:
-        revised = revise_post(llm, _pending_draft, feedback)
+        revised = revise_post(llm, _pending_draft, feedback, feedback_path=_FEEDBACK_PATH)
     except Exception:
         logger.exception("Failed to revise draft from admin feedback")
         await message.reply("⚠️ Не получилось переписать пост — попробуй ещё раз или жми «Новый пост» после следующего /postnow.")
         return
+    # R-CONVENIENCE: правка из этой кнопки не только чинит ТЕКУЩИЙ черновик —
+    # она же навсегда попадает в общий фидбек-лог (см. feedback_store.py),
+    # чтобы влиять на ВСЕ последующие посты, а не только на этот один (по
+    # прямой просьбе — "бот должен учиться на правках").
+    add_feedback(_FEEDBACK_PATH, feedback)
     _pending_draft = revised
     await message.reply(
-        f"✏️ <b>Переписал с учётом правки:</b>\n\n{_post_preview_text(revised)}",
+        f"✏️ <b>Переписал с учётом правки</b> (и запомнил её на будущее):\n\n{_post_preview_text(revised)}",
         reply_markup=_approval_keyboard(),
     )
 
@@ -615,6 +661,9 @@ _ADMIN_COMMANDS = _DEFAULT_COMMANDS + [
     BotCommand(command="addstory", description="Добавить личную историю в очередь"),
     BotCommand(command="stories", description="Очередь личных историй"),
     BotCommand(command="removestory", description="Удалить историю из очереди"),
+    BotCommand(command="feedback", description="Замечание по стилю — учту в следующих постах"),
+    BotCommand(command="feedbacklist", description="Список замечаний"),
+    BotCommand(command="removefeedback", description="Удалить замечание"),
     BotCommand(command="preview", description="Предпросмотр (можно: poll/feature/personal)"),
     BotCommand(command="postnow", description="Опубликовать сейчас (можно: poll/feature/personal)"),
     BotCommand(command="pause", description="Приостановить автопостинг"),
