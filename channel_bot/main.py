@@ -107,14 +107,19 @@ def _load_slot_overrides() -> list[dict]:
         return []
 
 
-def _add_slot_override(at: datetime, category: str) -> None:
+def _add_slot_override(at: datetime, category: str, *, text: str | None = None) -> None:
     """Разовое переопределение расписания на конкретный момент времени — см.
     /overridepost. `at` — момент, когда СРАЗУ запускать апрув/публикацию (не
     момент самого поста): если хочешь заранее с запасом на ревью — вычти
     _APPROVAL_LEAD_MINUTES сам при вызове, оверрайд эту логику не применяет
-    повторно (в отличие от обычного грид-расписания)."""
+    повторно (в отличие от обычного грид-расписания). `text` — если задан,
+    в апрув идёт этот ГОТОВЫЙ текст (без генерации LLM), category в этом
+    случае используется только для подписи/пометки в сообщении апрува."""
     overrides = _load_slot_overrides()
-    overrides.append({"at": at.isoformat(), "category": category})
+    entry = {"at": at.isoformat(), "category": category}
+    if text:
+        entry["text"] = text
+    overrides.append(entry)
     overrides.sort(key=lambda o: o["at"])
     Path(_SLOT_OVERRIDES_PATH).write_text(json.dumps(overrides, ensure_ascii=False, indent=2), encoding="utf-8")
 
@@ -466,9 +471,11 @@ async def _pin_if_intro(category: str | None, sent: Message) -> None:
         logger.exception("Failed to pin intro post — публикация прошла, но закрепить не получилось (нет прав у бота?)")
 
 
-async def _publish_generated_post(category: str | None = None) -> None:
-    sync_docs_repo(config.finassist_docs_path)
-    post = _generate_post_for_slot(category)
+async def _publish_generated_post(category: str | None = None, *, fixed_post: GeneratedPost | None = None) -> None:
+    post = fixed_post
+    if post is None:
+        sync_docs_repo(config.finassist_docs_path)
+        post = _generate_post_for_slot(category)
     sent = await _send_generated_post(config.channel_id, post)
     save_last_post_at(_POST_STATE_PATH, datetime.now(timezone.utc), title=_post_title(post))
     record_published_post(
@@ -546,10 +553,15 @@ async def cmd_overridepost(message: Message, command: CommandObject) -> None:
     if len(parts) != 3:
         await message.answer(
             "Формат: /overridepost 2026-07-18 10:00 intro\n"
-            "Дата и время — МСК, время самого поста (не апрува). Темы: poll|feature|personal|intro"
+            "Дата и время — МСК, время самого поста (не апрува). Темы: poll|feature|personal|intro\n"
+            "Ответь этой командой на сообщение с готовым текстом поста — тогда захардкодит именно этот "
+            "текст (без генерации LLM), category нужен только для пометки в апруве."
         )
         return
     date_str, time_str, category = parts
+    fixed_text = None
+    if message.reply_to_message:
+        fixed_text = (message.reply_to_message.text or message.reply_to_message.caption or "").strip() or None
     category = category.lower()
     if category not in _CATEGORY_LABELS:
         await message.answer(f"Неизвестная тема «{category}». Форматы: poll|feature|personal|intro")
@@ -567,8 +579,9 @@ async def cmd_overridepost(message: Message, command: CommandObject) -> None:
     else:
         trigger_at_utc = post_at_utc
         lead_note = ""
-    _add_slot_override(trigger_at_utc, category)
-    await message.answer(f"✅ На {date_str} {time_str} МСК запланирован пост: {_CATEGORY_LABELS[category]}{lead_note}")
+    _add_slot_override(trigger_at_utc, category, text=fixed_text)
+    text_note = " — с фиксированным текстом" if fixed_text else ""
+    await message.answer(f"✅ На {date_str} {time_str} МСК запланирован пост: {_CATEGORY_LABELS[category]}{text_note}{lead_note}")
 
 
 def _approval_keyboard() -> InlineKeyboardMarkup:
@@ -594,10 +607,12 @@ def _reject_followup_keyboard() -> InlineKeyboardMarkup:
     )
 
 
-async def _request_approval(category: str | None = None) -> None:
+async def _request_approval(category: str | None = None, *, fixed_post: GeneratedPost | None = None) -> None:
     global _pending_draft, _pending_photo, _awaiting_feedback, _pending_slot_category
-    sync_docs_repo(config.finassist_docs_path)
-    post = _generate_post_for_slot(category)
+    post = fixed_post
+    if post is None:
+        sync_docs_repo(config.finassist_docs_path)
+        post = _generate_post_for_slot(category)
     _pending_draft = post
     _pending_photo = None
     _awaiting_feedback = False
@@ -797,11 +812,13 @@ async def post_scheduled_content() -> None:
         # например, интро-пост вместо обычного слота в конкретный день.
         due_override = _pop_due_override(now)
         if due_override is not None:
+            fixed_text = due_override.get("text")
+            fixed_post = GeneratedPost(kind="text", text=fixed_text) if fixed_text else None
             try:
                 if _effective_require_approval:
-                    await _request_approval(category=due_override["category"])
+                    await _request_approval(category=due_override["category"], fixed_post=fixed_post)
                 else:
-                    await _publish_generated_post(category=due_override["category"])
+                    await _publish_generated_post(category=due_override["category"], fixed_post=fixed_post)
             except Exception:
                 logger.exception("Failed to handle slot override")
                 await asyncio.sleep(_RETRY_DELAY_SECONDS)
