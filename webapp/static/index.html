@@ -29,6 +29,8 @@
     --testing-soft: #dce9f0;
     --done: #8a9690;
     --done-soft: #e9ece8;
+    --cancelled: #a8524a;
+    --cancelled-soft: #f3e0dd;
     --danger: #b5432f;
     --shadow: 0 1px 2px rgba(22, 36, 29, 0.06), 0 6px 16px rgba(22, 36, 29, 0.06);
   }
@@ -50,6 +52,8 @@
       --testing-soft: #1c2e38;
       --done: #6b7a72;
       --done-soft: #1b2420;
+      --cancelled: #c97060;
+      --cancelled-soft: #3a2220;
       --danger: #d97a67;
       --shadow: 0 1px 2px rgba(0, 0, 0, 0.35), 0 8px 20px rgba(0, 0, 0, 0.3);
     }
@@ -70,6 +74,8 @@
     --testing-soft: #1c2e38;
     --done: #6b7a72;
     --done-soft: #1b2420;
+    --cancelled: #c97060;
+    --cancelled-soft: #3a2220;
     --danger: #d97a67;
     --shadow: 0 1px 2px rgba(0, 0, 0, 0.35), 0 8px 20px rgba(0, 0, 0, 0.3);
   }
@@ -89,6 +95,8 @@
     --testing-soft: #dce9f0;
     --done: #8a9690;
     --done-soft: #e9ece8;
+    --cancelled: #a8524a;
+    --cancelled-soft: #f3e0dd;
     --danger: #b5432f;
     --shadow: 0 1px 2px rgba(22, 36, 29, 0.06), 0 6px 16px rgba(22, 36, 29, 0.06);
   }
@@ -139,6 +147,15 @@
   .dot-open { background: var(--accent); }
   .dot-testing { background: var(--testing); }
   .dot-done { background: var(--done); }
+
+  .sprint-banner {
+    font-family: var(--font-mono);
+    font-variant-numeric: tabular-nums;
+    font-size: 12px;
+    color: var(--text-muted);
+    padding: 8px 2px 0;
+  }
+  .sprint-banner b { color: var(--text); font-weight: 600; }
 
   .history-toggle {
     background: none;
@@ -239,6 +256,7 @@
     transition: transform 0.1s ease, opacity 0.1s ease;
   }
   button.ghost { background: var(--surface-2); color: var(--text); }
+  button.ghost.danger { color: var(--cancelled); }
   button:disabled { opacity: 0.5; cursor: default; }
   button:active { transform: scale(0.96); }
   button:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
@@ -373,6 +391,7 @@
     <header class="board-head">
       <h1>Доска задач «Кубышка»</h1>
       <div class="tally" id="tally"></div>
+      <div class="sprint-banner" id="sprint-banner"></div>
       <button class="history-toggle" id="history-toggle">Показать всю историю</button>
       <div class="error-banner" id="error-banner"></div>
     </header>
@@ -482,6 +501,7 @@ function escapeHtml(text) {
 function statusLabel(status) {
   if (status === "testing") return "Тестируется";
   if (status === "done") return "Готово";
+  if (status === "cancelled") return "Отменена";
   return "Открыта";
 }
 
@@ -531,6 +551,7 @@ function buildTaskActions(task) {
     wrap.appendChild(makeButton("Вернуть в работу", "ghost", () => act(`/api/tasks/${task.id}/reopen`, {})));
   }
   wrap.appendChild(makeButton("Готово", "", () => act(`/api/tasks/${task.id}/complete`, {})));
+  wrap.appendChild(makeButton("Отменить", "ghost danger", () => act(`/api/tasks/${task.id}/cancel`, {})));
   return wrap;
 }
 
@@ -633,6 +654,20 @@ function renderTally(tasks) {
     `<span><span class="dot dot-open"></span><b>${open}</b> открыто</span>` +
     `<span><span class="dot dot-testing"></span><b>${testing}</b> на тестировании</span>` +
     `<span><span class="dot dot-done"></span><b>${done}</b> готово</span>`;
+}
+
+async function loadSprint() {
+  // Тихо игнорируем ошибки — баннер спринта необязателен для работы доски.
+  try {
+    const sprint = await api("/api/sprint", {});
+    document.getElementById("sprint-banner").innerHTML =
+      `📊 Спринт <b>${sprint.period_label}</b>: ` +
+      `✅ <b>${sprint.done_count}</b> сделали · ` +
+      `❌ <b>${sprint.cancelled_count}</b> отменили · ` +
+      `➡️ <b>${sprint.still_open_count}</b> перенесли`;
+  } catch {
+    /* баннер спринта необязателен — тихо пропускаем */
+  }
 }
 
 async function loadTasks() {
@@ -773,9 +808,13 @@ document.getElementById("new-task-input").addEventListener("keydown", (e) => {
 });
 
 loadTasks().catch((e) => showError(e.message));
+loadSprint();
 // Живое обновление без вебсокетов — поллинг раз в 5с достаточно для команды
 // из нескольких человек, не усложняем инфраструктуру ради «реального времени».
-setInterval(() => loadTasks().catch((e) => showError(e.message)), 5000);
+setInterval(() => {
+  loadTasks().catch((e) => showError(e.message));
+  loadSprint();
+}, 5000);
 </script>
 </body>
 </html>

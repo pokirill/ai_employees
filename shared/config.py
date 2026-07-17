@@ -109,6 +109,11 @@ class TaskBoardConfig:
     # team_bot сообщает, что мини-апп ещё не задеплоен, вместо падения.
     webapp_url: str = field(default_factory=lambda: _optional("WEBAPP_URL"))
     webapp_port: int = field(default_factory=lambda: int(_optional("WEBAPP_PORT", "8080")))
+    # Где хранится момент окончания последнего спринта (см.
+    # shared/sprint_state.py) — общий путь для team_bot (двигает границу раз
+    # в неделю) и webapp (только читает её для отображения на доске), это
+    # два независимо деплоящихся процесса, файл — их общая точка синхронизации.
+    sprint_state_path: str = field(default_factory=lambda: _optional("SPRINT_STATE_PATH", "team_bot_last_sprint.json"))
 
 
 @dataclass(frozen=True)

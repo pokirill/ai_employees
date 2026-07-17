@@ -1,12 +1,10 @@
 from __future__ import annotations
 
 import asyncio
-import json
 import logging
 import re
 from collections import defaultdict, deque
 from datetime import datetime, timedelta, timezone
-from pathlib import Path
 
 from aiogram import Bot, Dispatcher, F
 from aiogram.client.default import DefaultBotProperties
@@ -23,6 +21,7 @@ from shared.llm_client import LLMClient
 from shared.rate_limiter import SlidingWindowLimiter
 from shared.reminder_digest import build_reminder_digest
 from shared.sprint_digest import build_sprint_digest
+from shared.sprint_state import current_sprint_period, save_last_sprint_at
 from shared.task_store import TaskNotFound, TaskStore
 
 logging.basicConfig(level=logging.INFO)
@@ -368,34 +367,6 @@ async def reminder_loop() -> None:
             logger.exception("Reminder loop iteration failed")
 
 
-_SPRINT_STATE_PATH = "team_bot_last_sprint.json"
-
-
-def _load_last_sprint_at() -> datetime | None:
-    path = Path(_SPRINT_STATE_PATH)
-    if not path.exists():
-        return None
-    try:
-        return datetime.fromisoformat(json.loads(path.read_text(encoding="utf-8"))["sent_at"])
-    except Exception:
-        return None
-
-
-def _save_last_sprint_at(when: datetime) -> None:
-    Path(_SPRINT_STATE_PATH).write_text(json.dumps({"sent_at": when.isoformat()}), encoding="utf-8")
-
-
-def _current_sprint_period() -> tuple[datetime, datetime]:
-    """(since, now) — since — момент окончания ПРЕДЫДУЩЕГО спринта (UTC-aware,
-    т.к. TaskStore хранит completed_at/cancelled_at в UTC), первый раз — 7
-    дней назад. Отдельно от _seconds_until_next_sprint_boundary, которая
-    считает по местному времени машины — это две разные вещи (когда
-    сработать vs что считать периодом)."""
-    since = _load_last_sprint_at() or (datetime.now(timezone.utc) - timedelta(days=7))
-    now = datetime.now(timezone.utc)
-    return since, now
-
-
 def _build_sprint_digest_for_period(since: datetime, now: datetime) -> str | None:
     # R-COST: ни одного вызова LLM — чисто структурные данные доски (см.
     # shared/sprint_digest.py). По прямой просьбе минимизировать расход
@@ -411,7 +382,7 @@ def _build_sprint_digest_for_period(since: datetime, now: datetime) -> str | Non
 async def cmd_sprint_now(message: Message) -> None:
     # Превью текущего периода спринта — НЕ продвигает границу (в отличие от
     # sprint_loop), чтобы проверка формата не сбивала реальный недельный цикл.
-    since, now = _current_sprint_period()
+    since, now = current_sprint_period(board_config.sprint_state_path)
     digest = _build_sprint_digest_for_period(since, now)
     await message.answer(digest or "За текущий период спринта пока пусто — нечего подводить 🎉")
 
@@ -433,9 +404,9 @@ async def sprint_loop() -> None:
     while True:
         try:
             await asyncio.sleep(_seconds_until_next_sprint_boundary())
-            since, now = _current_sprint_period()
+            since, now = current_sprint_period(board_config.sprint_state_path)
             digest = _build_sprint_digest_for_period(since, now)
-            _save_last_sprint_at(now)
+            save_last_sprint_at(board_config.sprint_state_path, now)
             if digest:
                 await bot.send_message(config.team_chat_id, digest)
         except Exception:

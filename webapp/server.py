@@ -9,6 +9,7 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
 from shared.config import TaskBoardConfig
+from shared.sprint_state import current_sprint_period
 from shared.task_store import Task, TaskNotFound, TaskStore
 from shared.telegram_webapp_auth import InvalidInitData, validate_init_data
 
@@ -90,6 +91,7 @@ def _task_to_dict(task: Task) -> dict:
         "created_by": task.created_by,
         "created_at": task.created_at,
         "completed_at": task.completed_at,
+        "cancelled_at": task.cancelled_at,
         "comments": [{"author": c.author, "text": c.text, "created_at": c.created_at} for c in task.comments],
     }
 
@@ -150,10 +152,33 @@ def complete_task(task_id: int, payload: InitDataPayload) -> dict:
     return _with_404(lambda: _store.complete_task(task_id))
 
 
+@app.post("/api/tasks/{task_id}/cancel")
+def cancel_task(task_id: int, payload: InitDataPayload) -> dict:
+    # Отдельно от complete — "отменили" и "сделали" разные исходы для
+    # недельного спринт-дайджеста (см. shared/sprint_digest.py).
+    _authenticated_user(payload.init_data)
+    return _with_404(lambda: _store.cancel_task(task_id))
+
+
 @app.post("/api/tasks/{task_id}/reopen")
 def reopen_task(task_id: int, payload: InitDataPayload) -> dict:
     _authenticated_user(payload.init_data)
     return _with_404(lambda: _store.reopen_task(task_id))
+
+
+@app.post("/api/sprint")
+def sprint_status(payload: InitDataPayload) -> dict:
+    # Только ЧТЕНИЕ текущего периода — границу продвигает исключительно
+    # реальный еженедельный цикл в team_bot (см. shared/sprint_state.py),
+    # открытие доски не должно "закрывать" спринт как побочный эффект.
+    _authenticated_user(payload.init_data)
+    since, now = current_sprint_period(_board_config.sprint_state_path)
+    return {
+        "period_label": f"{since:%d.%m}–{now:%d.%m}",
+        "done_count": len(_store.list_done_since(since)),
+        "cancelled_count": len(_store.list_cancelled_since(since)),
+        "still_open_count": len(_store.list_tasks(include_done=False)),
+    }
 
 
 @app.post("/api/tasks/{task_id}/comment")
