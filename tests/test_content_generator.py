@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import pytest
 
-from channel_bot.content_generator import generate_next_post
+from channel_bot.content_generator import _chat_within_length_limit, generate_next_post
 from channel_bot.content_queue import load_queue, save_queue
 
 
@@ -257,3 +257,36 @@ def test_poll_parser_caps_at_ten_options():
     assert parsed is not None
     _, options = parsed
     assert len(options) == 10
+
+
+def test_chat_within_length_limit_returns_first_response_when_short_enough():
+    llm = _FakeLLM(responses=["короткий текст"])
+
+    text = _chat_within_length_limit(llm, "system", "user", max_tokens=100, limit_chars=350)
+
+    assert text == "короткий текст"
+    assert len(llm.calls) == 1
+
+
+def test_chat_within_length_limit_retries_once_when_too_long():
+    long_text = "а" * 400
+    short_text = "а" * 200
+    llm = _FakeLLM(responses=[long_text, short_text])
+
+    text = _chat_within_length_limit(llm, "system", "user", max_tokens=100, limit_chars=350)
+
+    assert text == short_text
+    assert len(llm.calls) == 2
+
+
+def test_chat_within_length_limit_gives_up_after_max_attempts():
+    # Единственный элемент — _FakeLLM возвращает его на каждый вызов без
+    # изменений (см. её .chat()), имитируя модель, которая не может
+    # уложиться в лимит даже после подсказок сократить.
+    long_text = "а" * 400
+    llm = _FakeLLM(responses=[long_text])
+
+    text = _chat_within_length_limit(llm, "system", "user", max_tokens=100, limit_chars=350)
+
+    assert text == long_text  # не блокируем публикацию — админ увидит длинный черновик на ревью
+    assert len(llm.calls) == 3  # 1 первая попытка + 2 повтора (_LENGTH_RETRY_ATTEMPTS)

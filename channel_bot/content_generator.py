@@ -64,8 +64,14 @@ _SYSTEM_PROMPT_BODY = (
     "ПОЛЬЗОВАТЕЛЬСКУЮ выгоду и пиши только про неё, не касаясь того, как это "
     "устроено внутри.\n"
     "НИКОГДА не упоминай статус разработки/тестирования/сборки — что "
-    "запушено, что на очереди, готовность билда, QA, код-ревью. Это "
-    "внутренний процесс команды, а не то, что видит пользователь.\n"
+    "запушено, что на очереди, готовность билда, QA, код-ревью, «гейт N», "
+    "приоритеты вида P0/P1, номера/хэши коммитов, количество прошедших "
+    "тестов. Это внутренний процесс команды, а не то, что видит пользователь.\n"
+    "НИКОГДА не копируй в пост внутренние технические идентификаторы из "
+    "темы буквально — имена полей/переменных (например person_id, "
+    "display_name), названия функций/классов, пути API/эндпоинты, названия "
+    "внутренних сервисов. Если тема содержит такие детали — перескажи "
+    "СМЫСЛ простыми словами пользователя, не называя сам технический термин.\n"
     "Тема поста может описывать НЕСКОЛЬКО разных изменений сразу (запись из "
     "инженерного лога часто так устроена) — выбери из них ОДНО, самое "
     "понятное и интересное читателю, и пиши только про него, полностью "
@@ -239,8 +245,15 @@ _TOPIC_CLASSIFIER_PROMPT = (
     "приложении. НЕ подходит — если это внутренняя механика: аналитика, "
     "метрики, инструментация, код-ревью, рефакторинг, тесты, бэкенд/API-детали, "
     "миграции, антиотточные или удерживающие механизмы, производительность — "
-    "всё, что пользователь не видит и не должен видеть. При сомнении — 'нет'. "
-    "Ответь ТОЛЬКО одним словом: 'да' или 'нет'."
+    "всё, что пользователь не видит и не должен видеть.\n"
+    "ВАЖНО: запись может УПОМИНАТЬ отдельную пользовательскую деталь внутри "
+    "длинного технического отчёта (гейты/тесты/ревью/приоритеты вроде P0, "
+    "коммиты, внутренние идентификаторы) — формальное присутствие такой "
+    "детали НЕ делает всю запись подходящей. Если запись В ОСНОВНОМ (по "
+    "объёму и заголовку) — отчёт о процессе разработки/тестирования/сборки, "
+    "а не описание фичи, отвечай 'нет', даже если где-то внутри есть "
+    "пользовательская деталь.\n"
+    "При сомнении — 'нет'. Ответь ТОЛЬКО одним словом: 'да' или 'нет'."
 )
 
 
@@ -303,9 +316,63 @@ def _build_revision_system_prompt(team_feedback: list[str] | None = None) -> str
         + "\n\nТебе дают уже готовый черновик поста и правку от админа канала "
         "(конкретное замечание, идею или пожелание). Перепиши пост с учётом этой "
         "правки, по-прежнему соблюдая все правила выше (длина, тон, без "
-        "внутренней механики и т.д.). Если правка расплывчата — истолкуй её в "
-        "духе пожеланий читателя канала, а не буквально дословно."
+        "внутренней механики и т.д.), КРОМЕ случаев, когда правка админа прямо "
+        "противоречит какому-то из этих правил (например, просит убрать "
+        "закрывающий вопрос, хотя обычное правило — всегда заканчивать "
+        "вопросом) — тогда выполняй ИМЕННО правку админа, это осознанное "
+        "разовое исключение для этого конкретного черновика, а не отмена "
+        "правила вообще. Если правка расплывчата — истолкуй её в духе "
+        "пожеланий читателя канала, а не буквально дословно."
     )
+
+
+# R-ROBUST: промпт называет лимит длины "важнее всех остальных правил", но
+# эмпирически модель иногда всё равно превышает его — особенно когда тема
+# бандлит несколько изменений сразу (см. память проекта: 2 из 10 реальных
+# генераций по объёмной записи changelog превысили 350 символов ОДНОВРЕМЕННО
+# с нарушением правила "выбери ОДНО"). Промпт-инжиниринг не даёт 100%
+# соблюдения жёсткого числового лимита — нужен детерминированный код-бэкстоп,
+# тот же принцип, что retry-on-empty в shared/llm_client.py для другого
+# класса сбоев (там — пустой ответ reasoning-модели, здесь — превышение длины).
+# Числа здесь ДОЛЖНЫ совпадать с тем, что написано в самом промпте
+# (_LENGTH_CAP_RULE/_INTRO_LENGTH_CAP_RULE) — если меняешь лимит в промпте,
+# поменяй и здесь.
+_POST_LENGTH_LIMIT_CHARS = 350
+_INTRO_LENGTH_LIMIT_CHARS = 700
+_LENGTH_RETRY_ATTEMPTS = 2
+
+
+def _chat_within_length_limit(
+    llm: LLMClient, system_prompt: str, user_content: str, *, max_tokens: int, limit_chars: int
+) -> str:
+    """Просит модель сократить СВОЙ ЖЕ предыдущий ответ (не генерирует с нуля
+    заново) — если предыдущая попытка превысила лимит, у модели уже есть
+    конкретный текст, который нужно урезать, а не риск снова случайно
+    забандлить несколько тем в новой попытке "с нуля"."""
+    messages: list[dict[str, str]] = [
+        {"role": "system", "content": system_prompt},
+        {"role": "user", "content": user_content},
+    ]
+    text = llm.chat(messages, max_tokens=max_tokens)
+    for _ in range(_LENGTH_RETRY_ATTEMPTS):
+        if len(text) <= limit_chars:
+            return text
+        messages = messages + [
+            {"role": "assistant", "content": text},
+            {
+                "role": "user",
+                "content": (
+                    f"Это {len(text)} символов — превышает лимит {limit_chars}. "
+                    "Сократи текст, убрав менее важные детали, но сохрани "
+                    "структуру абзацев и общий смысл."
+                ),
+            },
+        ]
+        text = llm.chat(messages, max_tokens=max_tokens)
+    # Попытки исчерпаны — возвращаем последний вариант как есть, не блокируя
+    # публикацию полностью; админ всё равно увидит черновик на ревью и может
+    # среагировать (реролл/правки), если он всё ещё слишком длинный.
+    return text
 
 
 def revise_post(llm: LLMClient, original: GeneratedPost, feedback: str, *, feedback_path: str = "") -> GeneratedPost:
@@ -316,15 +383,12 @@ def revise_post(llm: LLMClient, original: GeneratedPost, feedback: str, *, feedb
     отдельно сохраняет туда этот же feedback ПОСЛЕ вызова, чтобы он повлиял
     на БУДУЩИЕ посты, а не только переписал текущий черновик."""
     team_feedback = load_feedback(feedback_path) if feedback_path else None
-    text = llm.chat(
-        [
-            {"role": "system", "content": _build_revision_system_prompt(team_feedback)},
-            {
-                "role": "user",
-                "content": f"Черновик поста:\n{original.text}\n\nПравка от админа:\n{feedback}",
-            },
-        ],
+    text = _chat_within_length_limit(
+        llm,
+        _build_revision_system_prompt(team_feedback),
+        f"Черновик поста:\n{original.text}\n\nПравка от админа:\n{feedback}",
         max_tokens=_POST_MAX_TOKENS,
+        limit_chars=_POST_LENGTH_LIMIT_CHARS,
     )
     return GeneratedPost(kind="text", text=text)
 
@@ -364,12 +428,12 @@ def _generate_post(
             return poll
         # Модель не ответила строгим форматом — не проваливаем публикацию
         # только из-за формата, тихо откатываемся на обычный текстовый пост.
-    text = llm.chat(
-        [
-            {"role": "system", "content": _build_system_prompt(team_feedback)},
-            {"role": "user", "content": _user_content_with_history(topic, recent_posts)},
-        ],
+    text = _chat_within_length_limit(
+        llm,
+        _build_system_prompt(team_feedback),
+        _user_content_with_history(topic, recent_posts),
         max_tokens=_POST_MAX_TOKENS,
+        limit_chars=_POST_LENGTH_LIMIT_CHARS,
     )
     return GeneratedPost(kind="text", text=text + _maybe_beta_invite(beta_invite_url))
 
@@ -520,11 +584,11 @@ def generate_intro_post(llm: LLMClient, docs_path: str, *, beta_invite_url: str 
     team_feedback = load_feedback(feedback_path) if feedback_path else None
     context = load_project_context(docs_path, max_chars=6000)
     system_prompt = _compose_prompt(_INTRO_SYSTEM_PROMPT_BODY, _INTRO_LENGTH_CAP_RULE, team_feedback)
-    text = llm.chat(
-        [
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": f"Контекст проекта «Кубышка»:\n{context}"},
-        ],
+    text = _chat_within_length_limit(
+        llm,
+        system_prompt,
+        f"Контекст проекта «Кубышка»:\n{context}",
         max_tokens=900,
+        limit_chars=_INTRO_LENGTH_LIMIT_CHARS,
     )
     return GeneratedPost(kind="text", text=text + _maybe_beta_invite(beta_invite_url))
