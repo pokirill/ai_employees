@@ -588,7 +588,8 @@ def _reject_followup_keyboard() -> InlineKeyboardMarkup:
             [
                 InlineKeyboardButton(text="🔄 Новый пост", callback_data="reroll_post"),
                 InlineKeyboardButton(text="✏️ Предложить правки", callback_data="suggest_edit"),
-            ]
+            ],
+            [InlineKeyboardButton(text="🚫 Не публиковать вообще", callback_data="discard_post")],
         ]
     )
 
@@ -703,6 +704,28 @@ async def cb_reroll_post(callback: CallbackQuery) -> None:
         await bot.send_message(
             config.admin_chat_id, "⚠️ Не получилось сгенерировать новый вариант — попробуй /postnow позже или проверь логи."
         )
+
+
+@dp.callback_query(F.data == "discard_post")
+async def cb_discard_post(callback: CallbackQuery) -> None:
+    # R-ROBUST: без этой кнопки любой отклонённый черновик рано или поздно
+    # заменяется НОВЫМ (реролл/правки) — свободного слота "ничего не решено,
+    # просто пусто" не было вообще. Это реально блокировало расписание:
+    # неразрешённый _pending_draft держит планировщик в ожидании (см.
+    # post_scheduled_content), включая разовые оверрайды типа интро-поста —
+    # поймано вживую (см. память проекта), когда черновик из ручного /draft
+    # завис бы и не пустил апрув интро-поста на следующее утро.
+    global _pending_draft, _pending_photo, _awaiting_feedback, _pending_slot_category
+    if not _is_admin_callback(callback):
+        await callback.answer("Только из админ-чата")
+        return
+    _pending_draft = None
+    _pending_photo = None
+    _awaiting_feedback = False
+    _pending_slot_category = None
+    if callback.message:
+        await callback.message.edit_text("🚫 Черновик отклонён, без замены. Следующий — по расписанию.")
+    await callback.answer("Ок, не публикуем")
 
 
 @dp.callback_query(F.data == "suggest_edit")
