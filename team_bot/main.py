@@ -5,6 +5,7 @@ import logging
 import re
 from collections import defaultdict, deque
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 
 from aiogram import Bot, Dispatcher, F
 from aiogram.client.default import DefaultBotProperties
@@ -12,6 +13,7 @@ from aiogram.enums import ParseMode
 from aiogram.filters import Command, CommandObject
 from aiogram.types import BotCommand, InlineKeyboardButton, InlineKeyboardMarkup, Message, WebAppInfo
 
+from shared.chat_log import append_chat_message, format_for_prompt, messages_since
 from shared.config import LLMConfig, TaskBoardConfig, TeamBotConfig
 from shared.context_heuristic import question_needs_project_context
 from shared.docs_context import load_project_context, sync_docs_repos, topic_context_files
@@ -43,6 +45,8 @@ tasks_store = TaskStore(board_config.db_path)
 # на чат, чтобы один болтливый чат не сжёг весь бюджет LLM.
 _rate_limiter = SlidingWindowLimiter(max_calls=config.max_questions_per_hour, window_seconds=3600)
 
+_CHAT_LOG_PATH = "team_bot_chat_log.json"
+
 # R-COST: контекст проекта (Docs/*.md обоих репо) — не на каждый вопрос, а
 # только когда похоже, что он реально нужен (см. question_needs_project_context).
 # Меньше max_chars, чем полный дефолт docs_context — команд-бот не обязан
@@ -61,6 +65,27 @@ _ANSWER_MAX_TOKENS = 500
 
 bot = Bot(token=config.telegram_token, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
 dp = Dispatcher()
+
+
+@dp.message.middleware()
+async def _log_team_chat_message(handler, event, data):
+    # Пассивное логирование чата команды — НОЛЬ вызовов LLM здесь, просто
+    # копим буфер для недельного анализа эффективности (см. sprint_loop /
+    # По просьбе Кирилла: "пусть наш чат читает и использует в качестве доп
+    # инфы"). Сделано как middleware, а не обычный @dp.message(...) хендлер —
+    # иначе по правилу "первый подошедший хендлер съедает апдейт" это
+    # выключило бы @упоминания/реплаи боту, которые должны доходить до
+    # handle_assistant_message ниже.
+    if (
+        config.team_chat_id
+        and str(event.chat.id) == config.team_chat_id
+        and event.text
+        and not event.text.startswith("/")
+        and not (event.from_user and event.from_user.is_bot)
+    ):
+        author = event.from_user.full_name if event.from_user else "неизвестно"
+        append_chat_message(_CHAT_LOG_PATH, author=author, text=event.text)
+    return await handler(event, data)
 
 _SYSTEM_PROMPT = (
     "Ты — ассистент команды разработки приложения «Кубышка» (iOS-репозиторий "
@@ -367,15 +392,78 @@ async def reminder_loop() -> None:
             logger.exception("Reminder loop iteration failed")
 
 
-def _build_sprint_digest_for_period(since: datetime, now: datetime) -> str | None:
-    # R-COST: ни одного вызова LLM — чисто структурные данные доски (см.
-    # shared/sprint_digest.py). По прямой просьбе минимизировать расход
-    # OpenAI-токенов на эту фичу — сводка технически бесплатна.
+# По просьбе Кирилла: команда хочет не только "сделали/отменили/перенесли"
+# (см. shared/sprint_digest.py), но и оценку эффективности + план на
+# следующую неделю, исходя из стратегических целей проекта. Это два
+# конкретных документа верхнего уровня (не весь Docs/) — 1) сама стратегия
+# (диагноз/policy/вехи-гейты), 2) ближайший операционный план с датами —
+# оба небольшие (~5-9 КБ), читаем целиком, без topic-based урезания.
+_STRATEGY_DOC_PATHS = ["strategy/1_Kubyshka_Strategy.md", "strategy/2_Kubyshka_Development_Plan.md"]
+
+
+def _load_strategy_context() -> str:
+    parts = []
+    for rel_path in _STRATEGY_DOC_PATHS:
+        full_path = Path(config.finassist_docs_path) / rel_path
+        if full_path.exists():
+            parts.append(f"[{rel_path}]\n{full_path.read_text(encoding='utf-8')}")
+    return "\n\n".join(parts)
+
+
+_SPRINT_ANALYSIS_SYSTEM_PROMPT = (
+    "Ты — аналитик команды разработки приложения «Кубышка». Тебе дают: что "
+    "сделали/отменили/перенесли за прошедшую неделю на доске задач, "
+    "стратегические цели и ближайший план проекта (документы ниже), и "
+    "выдержку из рабочего чата команды за неделю (может отсутствовать).\n"
+    "Ответь коротко, по-русски, без канцелярита и воды, в 2 блока:\n"
+    "1) Оценка недели: насколько сделанное продвинуло команду к "
+    "стратегическим целям/ближайшим вехам — честно, без реверансов; если "
+    "продвижения не было или неделя ушла не туда — прямо так и скажи.\n"
+    "2) Приоритеты на следующую неделю: 2-3 конкретных пункта, вытекающих "
+    "из стратегии/плана и того, что ещё не сделано или обсуждалось в чате — "
+    "не абстрактные лозунги, а привязанные к реальным целям/этапам "
+    "документов.\n"
+    "Учитывай сигналы из чата (решения, проблемы, договорённости), если они "
+    "релевантны. Не выдумывай цифры и факты, которых нет в данных ниже — "
+    "если данных не хватает для какого-то вывода, честно скажи, что не уверен."
+)
+
+
+def _build_full_sprint_report(since: datetime, now: datetime) -> str | None:
+    # R-COST: механическая сводка (done/cancelled/still_open) — ноль вызовов
+    # LLM (см. shared/sprint_digest.py). Один-единственный доп. вызов LLM —
+    # только оценка+план поверх неё, и только если вообще есть что подводить
+    # (см. digest is None ниже) — идле-неделя не тратит токены зря.
     done = tasks_store.list_done_since(since)
     cancelled = tasks_store.list_cancelled_since(since)
     still_open = tasks_store.list_tasks(include_done=False)
     period_label = f"{since:%d.%m}–{now:%d.%m}"
-    return build_sprint_digest(done, cancelled, still_open, period_label=period_label)
+    digest = build_sprint_digest(done, cancelled, still_open, period_label=period_label)
+    if not digest:
+        return None
+    try:
+        chat_excerpt = format_for_prompt(messages_since(_CHAT_LOG_PATH, since))
+        sync_docs_repos(config.docs_paths)
+        strategy_context = _load_strategy_context()
+        user_content = f"Итоги недели по доске:\n{digest}\n\n"
+        if chat_excerpt:
+            user_content += f"Выдержка из чата команды за неделю:\n{chat_excerpt}\n\n"
+        user_content += f"Стратегия и план проекта:\n{strategy_context}"
+        analysis = llm.chat(
+            [
+                {"role": "system", "content": _SPRINT_ANALYSIS_SYSTEM_PROMPT},
+                {"role": "user", "content": user_content},
+            ],
+            max_tokens=700,
+        )
+    except Exception:
+        # Механическая сводка важнее — если анализ упал (нет ключа, сеть,
+        # провайдер лёг), всё равно отправляем то, что посчитали бесплатно.
+        logger.exception("Sprint analysis failed — sending mechanical digest only")
+        return digest
+    if not analysis:
+        return digest
+    return f"{digest}\n\n🧭 <b>Оценка недели и план:</b>\n{analysis}"
 
 
 @dp.message(Command("sprintnow"))
@@ -383,7 +471,7 @@ async def cmd_sprint_now(message: Message) -> None:
     # Превью текущего периода спринта — НЕ продвигает границу (в отличие от
     # sprint_loop), чтобы проверка формата не сбивала реальный недельный цикл.
     since, now = current_sprint_period(board_config.sprint_state_path)
-    digest = _build_sprint_digest_for_period(since, now)
+    digest = _build_full_sprint_report(since, now)
     await message.answer(digest or "За текущий период спринта пока пусто — нечего подводить 🎉")
 
 
@@ -405,7 +493,7 @@ async def sprint_loop() -> None:
         try:
             await asyncio.sleep(_seconds_until_next_sprint_boundary())
             since, now = current_sprint_period(board_config.sprint_state_path)
-            digest = _build_sprint_digest_for_period(since, now)
+            digest = _build_full_sprint_report(since, now)
             save_last_sprint_at(board_config.sprint_state_path, now)
             if digest:
                 await bot.send_message(config.team_chat_id, digest)

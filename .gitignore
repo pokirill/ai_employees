@@ -11,4 +11,5 @@ channel_bot/post_history_log.json
 channel_bot/slot_overrides.json
 channel_bot/last_triggered_slot.json
 team_bot_last_sprint.json
+team_bot_chat_log.json
 *.db
