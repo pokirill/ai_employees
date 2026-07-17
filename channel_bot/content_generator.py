@@ -310,20 +310,41 @@ def _write_poll(llm: LLMClient, topic: str) -> GeneratedPost | None:
     return GeneratedPost(kind="poll", question=question, options=options)
 
 
-def _build_revision_system_prompt(team_feedback: list[str] | None = None) -> str:
+def _revision_instruction() -> str:
     return (
-        _build_system_prompt(team_feedback)
-        + "\n\nТебе дают уже готовый черновик поста и правку от админа канала "
+        "Тебе дают уже готовый черновик поста и правку от админа канала "
         "(конкретное замечание, идею или пожелание). Перепиши пост с учётом этой "
-        "правки, по-прежнему соблюдая все правила выше (длина, тон, без "
-        "внутренней механики и т.д.), КРОМЕ случаев, когда правка админа прямо "
-        "противоречит какому-то из этих правил (например, просит убрать "
-        "закрывающий вопрос, хотя обычное правило — всегда заканчивать "
+        "правки, по-прежнему соблюдая все правила выше (длина, тон, структура "
+        "абзацев, без внутренней механики и т.д.), КРОМЕ случаев, когда правка "
+        "админа прямо противоречит какому-то из этих правил (например, просит "
+        "убрать закрывающий вопрос, хотя обычное правило — всегда заканчивать "
         "вопросом) — тогда выполняй ИМЕННО правку админа, это осознанное "
         "разовое исключение для этого конкретного черновика, а не отмена "
         "правила вообще. Если правка расплывчата — истолкуй её в духе "
         "пожеланий читателя канала, а не буквально дословно."
     )
+
+
+def _build_revision_system_prompt(body: str, length_rule: str, team_feedback: list[str] | None = None) -> str:
+    """body/length_rule — набор правил ИСХОДНОГО черновика (обычный пост vs
+    интро-пост, см. revise_post) — раньше эта функция всегда брала обычные
+    правила (_SYSTEM_PROMPT_BODY/_LENGTH_CAP_RULE) независимо от того, что
+    ревизуется, из-за чего правка интро-поста откатывала его к обычному
+    формату (короче, с дискуссионным вопросом вместо приглашения остаться).
+    Инструкция о правке — ПЕРЕД length_rule, не после (см. _LENGTH_CAP_RULE —
+    урок этой сессии, поймано трижды: всё, что добавлено после хардкапа
+    длины, размывает его)."""
+    parts = [body]
+    if team_feedback:
+        feedback_block = "\n".join(f"— {note}" for note in team_feedback)
+        parts.append(
+            "КОМАНДА ОСТАВИЛА ЭТИ ЗАМЕЧАНИЯ ПО ПРЕДЫДУЩИМ ПОСТАМ — учитывай их "
+            "наравне с правилами выше, это реальный фидбек от людей, которые "
+            f"публикуют посты:\n{feedback_block}"
+        )
+    parts.append(_revision_instruction())
+    parts.append(length_rule)
+    return "\n\n".join(parts)
 
 
 # R-ROBUST: промпт называет лимит длины "важнее всех остальных правил", но
@@ -375,20 +396,32 @@ def _chat_within_length_limit(
     return text
 
 
-def revise_post(llm: LLMClient, original: GeneratedPost, feedback: str, *, feedback_path: str = "") -> GeneratedPost:
+def revise_post(
+    llm: LLMClient, original: GeneratedPost, feedback: str, *, feedback_path: str = "", category: str | None = None
+) -> GeneratedPost:
     """Переписывает текстовый черновик с учётом правки админа (см. кнопку
     "Предложить правки" в main.py). Опросы не ревизуются здесь — main.py
     отсекает эту кнопку для kind="poll" ещё до вызова. feedback_path — путь к
     накопленным замечаниям команды (см. feedback_store.py); main.py сам
     отдельно сохраняет туда этот же feedback ПОСЛЕ вызова, чтобы он повлиял
-    на БУДУЩИЕ посты, а не только переписал текущий черновик."""
+    на БУДУЩИЕ посты, а не только переписал текущий черновик.
+    category="intro" — используй правила и лимит интро-поста (700 символов,
+    4 абзаца, мягкое приглашение остаться подписанным), а не обычные (350
+    символов, 3 абзаца, вопрос в конце) — main.py передаёт сюда
+    _pending_slot_category. Раньше category не было вообще, и правка
+    интро-поста ВСЕГДА откатывала его к обычному формату — поймано на
+    реальном черновике (см. память проекта)."""
     team_feedback = load_feedback(feedback_path) if feedback_path else None
+    if category == "intro":
+        body, length_rule, limit_chars, max_tokens = _INTRO_SYSTEM_PROMPT_BODY, _INTRO_LENGTH_CAP_RULE, _INTRO_LENGTH_LIMIT_CHARS, 900
+    else:
+        body, length_rule, limit_chars, max_tokens = _SYSTEM_PROMPT_BODY, _LENGTH_CAP_RULE, _POST_LENGTH_LIMIT_CHARS, _POST_MAX_TOKENS
     text = _chat_within_length_limit(
         llm,
-        _build_revision_system_prompt(team_feedback),
+        _build_revision_system_prompt(body, length_rule, team_feedback),
         f"Черновик поста:\n{original.text}\n\nПравка от админа:\n{feedback}",
-        max_tokens=_POST_MAX_TOKENS,
-        limit_chars=_POST_LENGTH_LIMIT_CHARS,
+        max_tokens=max_tokens,
+        limit_chars=limit_chars,
     )
     return GeneratedPost(kind="text", text=text)
 

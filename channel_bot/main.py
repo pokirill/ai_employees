@@ -741,7 +741,7 @@ async def handle_admin_feedback(message: Message) -> None:
     _awaiting_feedback = False
     await bot.send_chat_action(message.chat.id, "typing")
     try:
-        revised = revise_post(llm, _pending_draft, feedback, feedback_path=_FEEDBACK_PATH)
+        revised = revise_post(llm, _pending_draft, feedback, feedback_path=_FEEDBACK_PATH, category=_pending_slot_category)
     except Exception:
         logger.exception("Failed to revise draft from admin feedback")
         await message.reply("⚠️ Не получилось переписать пост — попробуй ещё раз или жми «Новый пост» после следующего /postnow.")
