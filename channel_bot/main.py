@@ -340,7 +340,15 @@ async def cmd_status(message: Message) -> None:
     override_at = _next_override_at()
     if override_at is not None and override_at < next_slot_dt:
         override_msk = override_at + timedelta(hours=_MSK_OFFSET_HOURS)
-        override_line = f"🗓 Оверрайд в очереди — апрув/публикация в {override_msk:%d.%m %H:%M} МСК\n"
+        pending_overrides = _load_slot_overrides()
+        next_override = pending_overrides[0] if pending_overrides else {}
+        fixed_text = next_override.get("text")
+        # Показываем сам текст, если он зафиксирован (/overridepost с готовым
+        # текстом) — без этого не видно, что реально уйдёт в апрув, только
+        # факт "оверрайд есть" (см. живую путаницу — /draft генерирует
+        # СЛУЧАЙНЫЙ черновик и вообще не трогает эту очередь).
+        text_preview = f"\n«{fixed_text[:120]}{'…' if len(fixed_text) > 120 else ''}»" if fixed_text else ""
+        override_line = f"🗓 Оверрайд в очереди — апрув/публикация в {override_msk:%d.%m %H:%M} МСК{text_preview}\n"
     else:
         override_line = ""
     lead_note = f" (черновик придёт за {_APPROVAL_LEAD_MINUTES} мин до этого)" if _effective_require_approval else ""
