@@ -56,6 +56,12 @@ class TeamBotConfig:
     # дайджеста открытых задач в TEAM_CHAT_ID. Не шлётся, если team_chat_id
     # не задан (см. team_bot/main.py reminder_loop).
     reminder_hour: int = field(default_factory=lambda: int(_optional("TEAM_REMINDER_HOUR", "10")))
+    # Час (в субботу, по локальному времени машины) итогов недельного спринта
+    # в TEAM_CHAT_ID — см. team_bot/main.py sprint_loop. Не шлётся, если
+    # team_chat_id не задан. Строится БЕЗ единого вызова LLM (см. R-COST в
+    # sprint_loop) — только структурные данные доски, поэтому по просьбе не
+    # тратит бюджет OpenAI вообще.
+    sprint_hour: int = field(default_factory=lambda: int(_optional("TEAM_SPRINT_HOUR", "19")))
 
     @property
     def docs_paths(self) -> list[str]:

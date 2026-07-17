@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import re
 from collections import defaultdict, deque
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
 
 from aiogram import Bot, Dispatcher, F
 from aiogram.client.default import DefaultBotProperties
@@ -20,6 +22,7 @@ from shared.icloud_reminders import TaskNotFound as ReminderTaskNotFound
 from shared.llm_client import LLMClient
 from shared.rate_limiter import SlidingWindowLimiter
 from shared.reminder_digest import build_reminder_digest
+from shared.sprint_digest import build_sprint_digest
 from shared.task_store import TaskNotFound, TaskStore
 
 logging.basicConfig(level=logging.INFO)
@@ -114,10 +117,12 @@ async def cmd_help(message: Message) -> None:
         "/unclaim &lt;номер&gt; — отпустить задачу\n"
         "/testing &lt;номер&gt; — отправить на тестирование\n"
         "/done &lt;номер&gt; — отметить задачу выполненной\n"
+        "/cancel &lt;номер&gt; — отметить задачу отменённой (не «сделали»)\n"
         "/comment &lt;номер&gt; &lt;текст&gt; — комментарий к задаче\n"
         "/rename &lt;номер&gt; &lt;текст&gt; — переименовать задачу\n"
         "/board — открыть доску задач (мини-апп: карточка, комментарии, статус) — в личке\n"
-        "/remindnow — прислать дайджест открытых задач сейчас (обычно раз в день сам)\n\n"
+        "/remindnow — прислать дайджест открытых задач сейчас (обычно раз в день сам)\n"
+        f"/sprintnow — превью итогов спринта за текущий период (сам — по субботам в {config.sprint_hour}:00)\n\n"
         "<b>Ассистент</b>\n"
         "/ask &lt;вопрос&gt; — спросить про проект (контекст из Docs/ обоих репо)\n"
         "В группе: упомяни меня (@бот вопрос) или ответь на моё сообщение\n"
@@ -250,6 +255,22 @@ async def cmd_testing(message: Message, command: CommandObject) -> None:
     await message.answer(f"🧪 На тестировании: «{task.title}»")
 
 
+@dp.message(Command("cancel"))
+async def cmd_cancel(message: Message, command: CommandObject) -> None:
+    # Отдельно от /done — "отменили" и "сделали" разные исходы для
+    # недельного спринт-дайджеста (см. sprint_loop/build_sprint_digest).
+    arg = (command.args or "").strip()
+    if not arg.isdigit():
+        await message.answer("Формат: /cancel 7 (номер из /tasks или доски)")
+        return
+    try:
+        task = tasks_store.cancel_task(int(arg))
+    except TaskNotFound:
+        await message.answer("⚠️ Задача с таким номером не найдена — проверь /tasks.")
+        return
+    await message.answer(f"❌ Отменено: «{task.title}» (вернуть в работу можно через доску /board)")
+
+
 @dp.message(Command("mytasks"))
 async def cmd_mytasks(message: Message) -> None:
     _, user_id = _requester_identity(message)
@@ -345,6 +366,80 @@ async def reminder_loop() -> None:
                 await bot.send_message(config.team_chat_id, digest)
         except Exception:
             logger.exception("Reminder loop iteration failed")
+
+
+_SPRINT_STATE_PATH = "team_bot_last_sprint.json"
+
+
+def _load_last_sprint_at() -> datetime | None:
+    path = Path(_SPRINT_STATE_PATH)
+    if not path.exists():
+        return None
+    try:
+        return datetime.fromisoformat(json.loads(path.read_text(encoding="utf-8"))["sent_at"])
+    except Exception:
+        return None
+
+
+def _save_last_sprint_at(when: datetime) -> None:
+    Path(_SPRINT_STATE_PATH).write_text(json.dumps({"sent_at": when.isoformat()}), encoding="utf-8")
+
+
+def _current_sprint_period() -> tuple[datetime, datetime]:
+    """(since, now) — since — момент окончания ПРЕДЫДУЩЕГО спринта (UTC-aware,
+    т.к. TaskStore хранит completed_at/cancelled_at в UTC), первый раз — 7
+    дней назад. Отдельно от _seconds_until_next_sprint_boundary, которая
+    считает по местному времени машины — это две разные вещи (когда
+    сработать vs что считать периодом)."""
+    since = _load_last_sprint_at() or (datetime.now(timezone.utc) - timedelta(days=7))
+    now = datetime.now(timezone.utc)
+    return since, now
+
+
+def _build_sprint_digest_for_period(since: datetime, now: datetime) -> str | None:
+    # R-COST: ни одного вызова LLM — чисто структурные данные доски (см.
+    # shared/sprint_digest.py). По прямой просьбе минимизировать расход
+    # OpenAI-токенов на эту фичу — сводка технически бесплатна.
+    done = tasks_store.list_done_since(since)
+    cancelled = tasks_store.list_cancelled_since(since)
+    still_open = tasks_store.list_tasks(include_done=False)
+    period_label = f"{since:%d.%m}–{now:%d.%m}"
+    return build_sprint_digest(done, cancelled, still_open, period_label=period_label)
+
+
+@dp.message(Command("sprintnow"))
+async def cmd_sprint_now(message: Message) -> None:
+    # Превью текущего периода спринта — НЕ продвигает границу (в отличие от
+    # sprint_loop), чтобы проверка формата не сбивала реальный недельный цикл.
+    since, now = _current_sprint_period()
+    digest = _build_sprint_digest_for_period(since, now)
+    await message.answer(digest or "За текущий период спринта пока пусто — нечего подводить 🎉")
+
+
+def _seconds_until_next_sprint_boundary() -> float:
+    now = datetime.now()
+    days_until_saturday = (5 - now.weekday()) % 7  # Monday=0 ... Saturday=5
+    target = (now + timedelta(days=days_until_saturday)).replace(hour=config.sprint_hour, minute=0, second=0, microsecond=0)
+    if target <= now:
+        target += timedelta(days=7)
+    return (target - now).total_seconds()
+
+
+async def sprint_loop() -> None:
+    # Раз в неделю, в субботу в config.sprint_hour по местному времени машины
+    # — итоги спринта в TEAM_CHAT_ID. Граница периода продвигается ВСЕГДА
+    # (даже если сводка пустой период и не отправляется) — иначе пустая
+    # неделя задвоила бы период со следующей.
+    while True:
+        try:
+            await asyncio.sleep(_seconds_until_next_sprint_boundary())
+            since, now = _current_sprint_period()
+            digest = _build_sprint_digest_for_period(since, now)
+            _save_last_sprint_at(now)
+            if digest:
+                await bot.send_message(config.team_chat_id, digest)
+        except Exception:
+            logger.exception("Sprint loop iteration failed")
 
 
 def _ask_llm(history_key: _HistoryKey, question: str, *, force_context: bool = False) -> str:
@@ -476,10 +571,12 @@ _BOT_COMMANDS = [
     BotCommand(command="unclaim", description="Отпустить задачу"),
     BotCommand(command="testing", description="Отправить задачу на тестирование"),
     BotCommand(command="done", description="Отметить задачу выполненной"),
+    BotCommand(command="cancel", description="Отметить задачу отменённой"),
     BotCommand(command="comment", description="Комментарий к задаче"),
     BotCommand(command="rename", description="Переименовать задачу"),
     BotCommand(command="board", description="Доска задач (мини-апп)"),
     BotCommand(command="remindnow", description="Дайджест открытых задач сейчас"),
+    BotCommand(command="sprintnow", description="Превью итогов спринта"),
     BotCommand(command="ask", description="Спросить ассистента про проект"),
     BotCommand(command="id", description="ID текущего чата"),
     BotCommand(command="help", description="Список команд"),
@@ -496,8 +593,9 @@ async def main() -> None:
     await bot.set_my_commands(_BOT_COMMANDS)
     if config.team_chat_id:
         asyncio.create_task(reminder_loop())
+        asyncio.create_task(sprint_loop())
     else:
-        logger.info("TEAM_CHAT_ID не задан — ежедневный дайджест отключён (доступен вручную через /remindnow)")
+        logger.info("TEAM_CHAT_ID не задан — ежедневный дайджест и итоги спринта отключены (доступны вручную через /remindnow, /sprintnow)")
     await dp.start_polling(bot)
 
 

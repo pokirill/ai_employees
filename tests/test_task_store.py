@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import sqlite3
+from datetime import datetime, timedelta, timezone
 
 import pytest
 
@@ -163,3 +164,49 @@ def test_migrates_pre_existing_db_missing_new_columns(tmp_path):
     # Новые колонки реально пишутся, не только читаются с дефолтом.
     updated = store.set_description(tasks[0].id, "Догнали описание")
     assert updated.description == "Догнали описание"
+
+
+def test_cancel_task_sets_status_and_timestamp(store):
+    task = store.add_task("Задача", created_by="Аня")
+    cancelled = store.cancel_task(task.id)
+    assert cancelled.status == "cancelled"
+    assert cancelled.cancelled_at is not None
+
+
+def test_cancelled_tasks_excluded_from_list_tasks(store):
+    open_task = store.add_task("Открытая", created_by="Аня")
+    cancelled_task = store.add_task("Отменённая", created_by="Аня")
+    store.cancel_task(cancelled_task.id)
+
+    assert [t.id for t in store.list_tasks()] == [open_task.id]
+    assert [t.id for t in store.list_tasks(include_done=False)] == [open_task.id]
+
+
+def test_reopen_clears_cancelled_at(store):
+    task = store.add_task("Задача", created_by="Аня")
+    store.cancel_task(task.id)
+    reopened = store.reopen_task(task.id)
+    assert reopened.status == "open"
+    assert reopened.cancelled_at is None
+
+
+def test_list_done_since_filters_by_completion_time(store):
+    old_task = store.add_task("Старая", created_by="Аня")
+    recent_task = store.add_task("Недавняя", created_by="Аня")
+    store.complete_task(old_task.id)
+    store.complete_task(recent_task.id)
+
+    cutoff = datetime.now(timezone.utc) - timedelta(hours=1)
+    done_since = store.list_done_since(cutoff)
+
+    assert {t.id for t in done_since} == {old_task.id, recent_task.id}
+    assert store.list_done_since(datetime.now(timezone.utc) + timedelta(hours=1)) == []
+
+
+def test_list_cancelled_since_filters_by_cancellation_time(store):
+    task = store.add_task("Задача", created_by="Аня")
+    store.cancel_task(task.id)
+
+    cutoff = datetime.now(timezone.utc) - timedelta(hours=1)
+    assert [t.id for t in store.list_cancelled_since(cutoff)] == [task.id]
+    assert store.list_cancelled_since(datetime.now(timezone.utc) + timedelta(hours=1)) == []

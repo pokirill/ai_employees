@@ -17,7 +17,7 @@ class Comment:
 class Task:
     id: int
     title: str
-    status: str  # "open" | "testing" | "done"
+    status: str  # "open" | "testing" | "done" | "cancelled"
     claimed_by: str | None
     created_by: str
     created_at: str
@@ -32,6 +32,9 @@ class Task:
     claimed_by_user_id: int | None = None
     description: str | None = None
     comments: list[Comment] = field(default_factory=list)
+    # Заполняется только при status="cancelled" — для недельного
+    # спринт-дайджеста (shared/sprint_digest.py), симметрично completed_at.
+    cancelled_at: str | None = None
 
 
 class TaskNotFound(RuntimeError):
@@ -67,6 +70,7 @@ class TaskStore:
     _ADDED_COLUMNS = {
         "claimed_by_user_id": "INTEGER",
         "description": "TEXT",
+        "cancelled_at": "TEXT",
     }
 
     def _init_schema(self) -> None:
@@ -115,8 +119,11 @@ class TaskStore:
         статусом 'done', завершённые раньше этого срока, не возвращаются —
         доска не должна расти в бесконечную ленту старых готовых задач.
         Полная история всё равно доступна через include_done=True без этого
-        параметра (мини-апп даёт переключатель "показать всю историю")."""
-        query = "SELECT * FROM tasks WHERE 1=1"
+        параметра (мини-апп даёт переключатель "показать всю историю").
+        Отменённые задачи ('cancelled') сюда никогда не попадают — это
+        отдельная категория, видна только в недельном спринт-дайджесте
+        (см. list_cancelled_since), не в обычном списке доски."""
+        query = "SELECT * FROM tasks WHERE status != 'cancelled'"
         params: list[str] = []
         if not include_done:
             query += " AND status != 'done'"
@@ -127,6 +134,27 @@ class TaskStore:
         query += " ORDER BY (status = 'done'), created_at DESC"
         with self._connect() as conn:
             rows = conn.execute(query, params).fetchall()
+            tasks = [_row_to_task(row) for row in rows]
+            for task in tasks:
+                task.comments = self._load_comments(conn, task.id)
+        return tasks
+
+    def list_done_since(self, since: datetime) -> list[Task]:
+        """Для недельного спринт-дайджеста (shared/sprint_digest.py) —
+        задачи, завершённые с указанного момента."""
+        return self._list_by_status_since("done", "completed_at", since)
+
+    def list_cancelled_since(self, since: datetime) -> list[Task]:
+        """Для недельного спринт-дайджеста — задачи, отменённые с указанного
+        момента (см. cancel_task)."""
+        return self._list_by_status_since("cancelled", "cancelled_at", since)
+
+    def _list_by_status_since(self, status: str, timestamp_column: str, since: datetime) -> list[Task]:
+        with self._connect() as conn:
+            rows = conn.execute(
+                f"SELECT * FROM tasks WHERE status = ? AND {timestamp_column} >= ? ORDER BY {timestamp_column}",
+                (status, since.isoformat()),
+            ).fetchall()
             tasks = [_row_to_task(row) for row in rows]
             for task in tasks:
                 task.comments = self._load_comments(conn, task.id)
@@ -161,11 +189,20 @@ class TaskStore:
             task_id, "UPDATE tasks SET status = 'done', completed_at = ? WHERE id = ?", (_now(), task_id)
         )
 
-    def reopen_task(self, task_id: int) -> Task:
-        # Возвращает в "open" из любого статуса (testing или done) — единая
-        # операция, а не отдельная для каждого предыдущего состояния.
+    def cancel_task(self, task_id: int) -> Task:
+        # Отдельно от complete_task — "отменили" и "сделали" разные исходы
+        # для недельного спринт-дайджеста (см. list_cancelled_since).
         return self._update_or_raise(
-            task_id, "UPDATE tasks SET status = 'open', completed_at = NULL WHERE id = ?", (task_id,)
+            task_id, "UPDATE tasks SET status = 'cancelled', cancelled_at = ? WHERE id = ?", (_now(), task_id)
+        )
+
+    def reopen_task(self, task_id: int) -> Task:
+        # Возвращает в "open" из любого статуса (testing/done/cancelled) —
+        # единая операция, а не отдельная для каждого предыдущего состояния.
+        return self._update_or_raise(
+            task_id,
+            "UPDATE tasks SET status = 'open', completed_at = NULL, cancelled_at = NULL WHERE id = ?",
+            (task_id,),
         )
 
     def set_reminder_uid(self, task_id: int, reminder_uid: str) -> None:
@@ -218,6 +255,7 @@ def _row_to_task(row: sqlite3.Row) -> Task:
         reminder_uid=row["reminder_uid"],
         claimed_by_user_id=row["claimed_by_user_id"],
         description=row["description"],
+        cancelled_at=row["cancelled_at"],
     )
 
 
