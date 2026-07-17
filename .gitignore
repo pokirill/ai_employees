@@ -7,4 +7,5 @@ channel_bot/story_topics_queue.json
 channel_bot/used_changelog_titles.json
 channel_bot/last_post_state.json
 channel_bot/feedback_log.json
+channel_bot/post_history_log.json
 *.db

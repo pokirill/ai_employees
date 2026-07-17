@@ -6,6 +6,7 @@ from dataclasses import dataclass, field
 from channel_bot.changelog_entries import load_used_titles, mark_title_used, parse_changelog_entries
 from channel_bot.content_queue import peek_next_topic, pop_next_topic
 from channel_bot.feedback_store import load_feedback
+from channel_bot.post_history import load_recent_summaries
 from shared.docs_context import load_project_context
 from shared.llm_client import LLMClient
 
@@ -118,24 +119,28 @@ _LENGTH_CAP_RULE = (
 _SYSTEM_PROMPT = _SYSTEM_PROMPT_BODY + "\n" + _LENGTH_CAP_RULE
 
 
-def _build_system_prompt(team_feedback: list[str] | None = None) -> str:
+def _compose_prompt(body: str, length_rule: str, team_feedback: list[str] | None) -> str:
     """team_feedback — накопленные замечания команды (см. feedback_store.py и
     main.py: /feedback + правки из кнопки "Предложить правки"). Встраиваются
-    МЕЖДУ телом промпта и _LENGTH_CAP_RULE, чтобы хардкап длины всегда
-    оставался последней и самой заметной инструкцией, сколько бы замечаний
-    ни накопилось."""
+    МЕЖДУ телом промпта и length_rule, чтобы хардкап длины всегда оставался
+    последней и самой заметной инструкцией, сколько бы замечаний ни
+    накопилось (см. _LENGTH_CAP_RULE — урок с этой же сессии, поймано дважды)."""
     if not team_feedback:
-        return _SYSTEM_PROMPT
+        return body + "\n" + length_rule
     feedback_block = "\n".join(f"— {note}" for note in team_feedback)
     return (
-        _SYSTEM_PROMPT_BODY
+        body
         + "\n\nКОМАНДА ОСТАВИЛА ЭТИ ЗАМЕЧАНИЯ ПО ПРЕДЫДУЩИМ ПОСТАМ — учитывай их "
         "наравне с правилами выше, это реальный фидбек от людей, которые "
         "публикуют посты:\n"
         + feedback_block
         + "\n\n"
-        + _LENGTH_CAP_RULE
+        + length_rule
     )
+
+
+def _build_system_prompt(team_feedback: list[str] | None = None) -> str:
+    return _compose_prompt(_SYSTEM_PROMPT_BODY, _LENGTH_CAP_RULE, team_feedback)
 
 
 # R-COST: LLMConfig.reasoning_effort="minimal" убирает налог на скрытые
@@ -315,12 +320,29 @@ def revise_post(llm: LLMClient, original: GeneratedPost, feedback: str, *, feedb
     return GeneratedPost(kind="text", text=text)
 
 
+def _user_content_with_history(topic: str, recent_posts: list[str] | None) -> str:
+    """recent_posts — контекст (не постоянное правило, в отличие от
+    team_feedback), поэтому идёт в user-сообщение, а не в system-промпт: это
+    данные о том, что уже сказано, а не инструкция на будущее."""
+    content = f"Тема поста:\n{topic}"
+    if not recent_posts:
+        return content
+    history_block = "\n".join(f"- {p}" for p in recent_posts)
+    return (
+        content
+        + "\n\nПоследние опубликованные посты канала (для контекста — НЕ "
+        "повторяй те же темы, шутки, сравнения или структуру открытия, что "
+        f"уже были):\n{history_block}"
+    )
+
+
 def _generate_post(
     llm: LLMClient,
     topic: str,
     beta_invite_url: str = "",
     force_kind: str | None = None,
     team_feedback: list[str] | None = None,
+    recent_posts: list[str] | None = None,
 ) -> GeneratedPost:
     """force_kind=None — старое вероятностное поведение (см. _POLL_PROBABILITY,
     для необязательного /postnow и /preview). force_kind="poll"/"text" — для
@@ -336,7 +358,7 @@ def _generate_post(
     text = llm.chat(
         [
             {"role": "system", "content": _build_system_prompt(team_feedback)},
-            {"role": "user", "content": f"Тема поста:\n{topic}"},
+            {"role": "user", "content": _user_content_with_history(topic, recent_posts)},
         ],
         max_tokens=_POST_MAX_TOKENS,
     )
@@ -383,17 +405,20 @@ def generate_next_post(
     dry_run: bool = False,
     beta_invite_url: str = "",
     feedback_path: str = "",
+    history_path: str = "",
 ) -> GeneratedPost:
     """dry_run=True — для /preview: генерирует текст, НЕ трогая состояние
     (не выкидывает тему из очереди, не помечает запись changelog
     использованной), чтобы предпросмотр не "тратил" реальный контент.
     Свободный формат (без привязки к теме слота расписания) — см.
     generate_post_for_category для расписания с фиксированной темой на слот.
-    feedback_path — накопленные замечания команды, см. feedback_store.py."""
+    feedback_path — накопленные замечания команды, см. feedback_store.py.
+    history_path — последние опубликованные посты, см. post_history.py."""
     topic, has_specific_topic = _next_feature_topic(llm, queue_path, changelog_path, used_state_path, docs_path, dry_run=dry_run)
     force_kind = None if has_specific_topic else "text"
     team_feedback = load_feedback(feedback_path) if feedback_path else None
-    return _generate_post(llm, topic, beta_invite_url, force_kind=force_kind, team_feedback=team_feedback)
+    recent_posts = load_recent_summaries(history_path) if history_path else None
+    return _generate_post(llm, topic, beta_invite_url, force_kind=force_kind, team_feedback=team_feedback, recent_posts=recent_posts)
 
 
 def generate_post_for_category(
@@ -408,6 +433,7 @@ def generate_post_for_category(
     dry_run: bool = False,
     beta_invite_url: str = "",
     feedback_path: str = "",
+    history_path: str = "",
 ) -> GeneratedPost | None:
     """Для расписания с закреплённой темой на слот (см. main.py/_DAILY_SLOTS):
     category="feature" — обычный проблема→фича текст; category="poll" — тот
@@ -415,19 +441,75 @@ def generate_post_for_category(
     берётся ТОЛЬКО из отдельной очереди реальных историй (story_queue_path,
     см. /addstory) — вернёт None, если она пуста, а не выдумает историю;
     вызывающий код сам решает, чем заменить пустой слот. feedback_path —
-    накопленные замечания команды, см. feedback_store.py."""
+    накопленные замечания команды, см. feedback_store.py. history_path —
+    последние опубликованные посты, см. post_history.py."""
     if category not in _VALID_SLOT_CATEGORIES:
         raise ValueError(f"unknown slot category: {category!r}")
 
     team_feedback = load_feedback(feedback_path) if feedback_path else None
+    recent_posts = load_recent_summaries(history_path) if history_path else None
 
     if category == "personal":
         topic = peek_next_topic(story_queue_path) if dry_run else pop_next_topic(story_queue_path)
         if not topic:
             return None
-        return _generate_post(llm, topic, beta_invite_url, force_kind="text", team_feedback=team_feedback)
+        return _generate_post(llm, topic, beta_invite_url, force_kind="text", team_feedback=team_feedback, recent_posts=recent_posts)
 
     topic, has_specific_topic = _next_feature_topic(llm, queue_path, changelog_path, used_state_path, docs_path, dry_run=dry_run)
     if category == "poll" and has_specific_topic:
         return _generate_post(llm, topic, beta_invite_url, force_kind="poll", team_feedback=team_feedback)
-    return _generate_post(llm, topic, beta_invite_url, force_kind="text", team_feedback=team_feedback)
+    return _generate_post(llm, topic, beta_invite_url, force_kind="text", team_feedback=team_feedback, recent_posts=recent_posts)
+
+
+# Отдельный, не входящий в _VALID_SLOT_CATEGORIES промпт — закреплённый
+# вступительный пост, который прочитает КАЖДЫЙ новый подписчик, это
+# "эталонный" разовый пост про продукт целиком, а не про одну фичу/тему из
+# очереди. Не участвует в daily-расписании (см. main.py) — вызывается
+# вручную через /draft intro | /preview intro | /postnow intro.
+_INTRO_SYSTEM_PROMPT_BODY = (
+    "Ты пишешь ЗАКРЕПЛЁННЫЙ вступительный пост Telegram-канала приложения "
+    "«Кубышка» (личные финансы, копилка на цели). Этот пост будет висеть "
+    "закреплённым и его прочитает КАЖДЫЙ новый подписчик как первое "
+    "знакомство с каналом и приложением — пиши как тщательно выверенный "
+    "эталонный текст, не как обычный пост из ленты.\n"
+    "Расскажи простым языком, без канцелярита и без глубокого технического "
+    "разбора: кто мы, что за приложение «Кубышка» и какие конкретные "
+    "житейские проблемы с деньгами оно решает (накопить на цель, не терять "
+    "из виду мелкие траты, понять, куда уходят деньги, и т.п.) — используй "
+    "реальные факты и функции из контекста проекта ниже, не выдумывай "
+    "ничего, чего там нет.\n"
+    "Тон живой и тёплый, с лёгким юмором, но БЕЗ перебора — это лицо канала "
+    "для новых людей, а не шутка ради шутки; лёгкая ирония уместна, "
+    "кричащий кликбейт и балаган — нет.\n"
+    "Структура: короткий цепляющий заголовок → кто мы и какую проблему в "
+    "целом решаем (2-3 предложения) → что вообще можно найти в этом канале "
+    "дальше (коротко, по-настоящему, без обещаний того, чего не будет) → "
+    "мягкое приглашение остаться подписанным, без нажима и без \"подпишись\" "
+    "в лоб.\n"
+    "Не упоминай статус разработки, внутренние процессы, названия "
+    "задач/тикетов, технические детали реализации. Пиши так, будто "
+    "рассказываешь другу, который в первый раз услышал про приложение."
+)
+
+_INTRO_LENGTH_CAP_RULE = (
+    "ЖЁСТКИЙ ЛИМИТ ДЛИНЫ: весь пост, включая заголовок, — НЕ БОЛЬШЕ 700 "
+    "СИМВОЛОВ. Закреплённому посту можно чуть больше воздуха, чем обычным "
+    "постам (там лимит 350), но он всё равно должен читаться быстро, не как "
+    "лонгрид. Посчитай символы перед ответом — это жёсткий лимит, не пожелание."
+)
+
+
+def generate_intro_post(llm: LLMClient, docs_path: str, *, beta_invite_url: str = "", feedback_path: str = "") -> GeneratedPost:
+    """Разовый закреплённый пост "кто мы" — НЕ берёт тему из очереди/changelog,
+    вместо этого получает общий контекст проекта. Никогда не опрос."""
+    team_feedback = load_feedback(feedback_path) if feedback_path else None
+    context = load_project_context(docs_path, max_chars=6000)
+    system_prompt = _compose_prompt(_INTRO_SYSTEM_PROMPT_BODY, _INTRO_LENGTH_CAP_RULE, team_feedback)
+    text = llm.chat(
+        [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": f"Контекст проекта «Кубышка»:\n{context}"},
+        ],
+        max_tokens=900,
+    )
+    return GeneratedPost(kind="text", text=text + _maybe_beta_invite(beta_invite_url))

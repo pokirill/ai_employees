@@ -10,9 +10,10 @@ from aiogram.enums import ParseMode
 from aiogram.filters import Command, CommandObject
 from aiogram.types import BotCommand, BotCommandScopeChat, CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message
 
-from channel_bot.content_generator import GeneratedPost, generate_next_post, generate_post_for_category, revise_post
+from channel_bot.content_generator import GeneratedPost, generate_intro_post, generate_next_post, generate_post_for_category, revise_post
 from channel_bot.content_queue import append_topic, load_queue, save_queue
 from channel_bot.feedback_store import add_feedback, load_feedback, remove_feedback
+from channel_bot.post_history import record_published_post
 from channel_bot.post_state import load_last_post_info, save_last_post_at
 from shared.config import ChannelBotConfig, LLMConfig
 from shared.docs_context import load_project_context, sync_docs_repo
@@ -33,6 +34,7 @@ _STORY_QUEUE_PATH = "channel_bot/story_topics_queue.json"
 _CHANGELOG_STATE_PATH = "channel_bot/used_changelog_titles.json"
 _POST_STATE_PATH = "channel_bot/last_post_state.json"
 _FEEDBACK_PATH = "channel_bot/feedback_log.json"
+_HISTORY_PATH = "channel_bot/post_history_log.json"
 
 # По просьбе — 2-3 поста в день с ЗАКРЕПЛЁННОЙ темой на слот вместо случайного
 # формата каждый раз (было: 1 пост/сутки, формат — рулетка). Время — МСК,
@@ -45,7 +47,7 @@ _DAILY_SLOTS: list[tuple[int, int, str]] = [
     (14, 30, "feature"),
     (19, 30, "personal"),
 ]
-_CATEGORY_LABELS = {"poll": "опрос", "feature": "про фичу", "personal": "личная история"}
+_CATEGORY_LABELS = {"poll": "опрос", "feature": "про фичу", "personal": "личная история", "intro": "закреплённый интро-пост"}
 # Россия не переходит на летнее время — фиксированный оффсет ок, без tzdata.
 _MSK_OFFSET_HOURS = 3
 
@@ -305,23 +307,33 @@ def _post_preview_text(post: GeneratedPost) -> str:
     return post.text
 
 
-async def _send_generated_post(chat_id: str, post: GeneratedPost, photo: str | None = None) -> None:
+def _post_history_summary(post: GeneratedPost) -> str:
+    """Короткая запись для post_history.py — то, что реальный будущий пост
+    увидит в промпте как "уже сказанное", не полный текст."""
+    if post.kind == "poll":
+        return f"[опрос] {post.question}"
+    return post.text[:220]
+
+
+async def _send_generated_post(chat_id: str, post: GeneratedPost, photo: str | None = None) -> Message:
     if post.kind == "poll":
         # Telegram-опросы не поддерживают вложенное фото в том же сообщении —
         # если админ всё же прислал фото к черновику-опросу, тихо игнорируем
         # его здесь (handle_admin_photo уже предупреждает об этом при приёме).
-        await bot.send_poll(chat_id, post.question, post.options, is_anonymous=True)
+        return await bot.send_poll(chat_id, post.question, post.options, is_anonymous=True)
     elif photo:
-        await bot.send_photo(chat_id, photo=photo, caption=post.text)
+        return await bot.send_photo(chat_id, photo=photo, caption=post.text)
     else:
-        await bot.send_message(chat_id, post.text)
+        return await bot.send_message(chat_id, post.text)
 
 
 def _generate_post_for_slot(category: str | None, *, dry_run: bool = False) -> GeneratedPost:
     """category=None — свободный формат (ручной /postnow и /preview без
-    аргумента). Иначе — тема слота расписания (см. _DAILY_SLOTS); для
-    category="personal" с пустой очередью историй тихо подменяет на
-    category="feature", а не выдумывает историю (см. generate_post_for_category)."""
+    аргумента). category="intro" — разовый закреплённый пост "кто мы", своя
+    генерация без темы (см. generate_intro_post). Иначе — тема слота
+    расписания (см. _DAILY_SLOTS); для category="personal" с пустой
+    очередью историй тихо подменяет на category="feature", а не выдумывает
+    историю (см. generate_post_for_category)."""
     if category is None:
         return generate_next_post(
             llm,
@@ -332,7 +344,10 @@ def _generate_post_for_slot(category: str | None, *, dry_run: bool = False) -> G
             dry_run=dry_run,
             beta_invite_url=config.beta_invite_url,
             feedback_path=_FEEDBACK_PATH,
+            history_path=_HISTORY_PATH,
         )
+    if category == "intro":
+        return generate_intro_post(llm, config.finassist_docs_path, beta_invite_url=config.beta_invite_url, feedback_path=_FEEDBACK_PATH)
     post = generate_post_for_category(
         llm,
         category,
@@ -344,6 +359,7 @@ def _generate_post_for_slot(category: str | None, *, dry_run: bool = False) -> G
         dry_run=dry_run,
         beta_invite_url=config.beta_invite_url,
         feedback_path=_FEEDBACK_PATH,
+        history_path=_HISTORY_PATH,
     )
     if post is None:
         logger.info("Story queue empty for 'personal' slot — falling back to 'feature' category")
@@ -351,18 +367,35 @@ def _generate_post_for_slot(category: str | None, *, dry_run: bool = False) -> G
     return post
 
 
+async def _pin_if_intro(category: str | None, sent: Message) -> None:
+    # R-CONVENIENCE: единственная категория, которую нужно закреплять — по
+    # прямой просьбе ("это сообщение мы закрепим"). Требует прав админа с
+    # can_pin_messages в канале — если их нет, публикация всё равно прошла,
+    # только пин не сработал, поэтому не роняем публикацию из-за этого.
+    if category != "intro":
+        return
+    try:
+        await bot.pin_chat_message(config.channel_id, sent.message_id)
+    except Exception:
+        logger.exception("Failed to pin intro post — публикация прошла, но закрепить не получилось (нет прав у бота?)")
+
+
 async def _publish_generated_post(category: str | None = None) -> None:
     sync_docs_repo(config.finassist_docs_path)
     post = _generate_post_for_slot(category)
-    await _send_generated_post(config.channel_id, post)
+    sent = await _send_generated_post(config.channel_id, post)
     save_last_post_at(_POST_STATE_PATH, datetime.now(timezone.utc), title=_post_title(post))
+    record_published_post(
+        _HISTORY_PATH, category=category, summary=_post_history_summary(post), published_at=datetime.now(timezone.utc).isoformat()
+    )
+    await _pin_if_intro(category, sent)
 
 
 @dp.message(Command("postnow"), F.func(_admin_filter))
 async def cmd_postnow(message: Message, command: CommandObject) -> None:
     category = (command.args or "").strip().lower() or None
     if category and category not in _CATEGORY_LABELS:
-        await message.answer(f"Неизвестная тема «{category}». Форматы: /postnow [poll|feature|personal]")
+        await message.answer(f"Неизвестная тема «{category}». Форматы: /postnow [poll|feature|personal|intro]")
         return
     await message.answer("Публикую…")
     try:
@@ -378,7 +411,7 @@ async def cmd_postnow(message: Message, command: CommandObject) -> None:
 async def cmd_preview(message: Message, command: CommandObject) -> None:
     category = (command.args or "").strip().lower() or None
     if category and category not in _CATEGORY_LABELS:
-        await message.answer(f"Неизвестная тема «{category}». Форматы: /preview [poll|feature|personal]")
+        await message.answer(f"Неизвестная тема «{category}». Форматы: /preview [poll|feature|personal|intro]")
         return
     await message.answer("Генерирую предпросмотр (очередь/changelog не тронуты)…")
     try:
@@ -389,6 +422,31 @@ async def cmd_preview(message: Message, command: CommandObject) -> None:
         await message.answer("⚠️ Не получилось сгенерировать предпросмотр.")
         return
     await message.answer(f"👀 <b>Предпросмотр следующего поста:</b>\n\n{_post_preview_text(preview_post)}")
+
+
+@dp.message(Command("draft"), F.func(_admin_filter))
+async def cmd_draft(message: Message, command: CommandObject) -> None:
+    # R-CONVENIENCE: в отличие от /postnow (публикует НЕМЕДЛЕННО), это
+    # запрашивает черновик через обычный флоу ревью (кнопки апрув/реролл/
+    # правки) вне расписания — нужно, например, чтобы вечером спокойно
+    # довести до ума разовый intro-пост, а не ждать его слота в расписании
+    # (у intro и вовсе нет слота в _DAILY_SLOTS).
+    category = (command.args or "").strip().lower() or None
+    if category and category not in _CATEGORY_LABELS:
+        await message.answer(f"Неизвестная тема «{category}». Форматы: /draft [poll|feature|personal|intro]")
+        return
+    if not config.admin_chat_id:
+        await message.answer("Нужно задать CHANNEL_ADMIN_CHAT_ID, чтобы черновик было куда прислать.")
+        return
+    if _pending_draft is not None:
+        await message.answer("Уже есть черновик, ждущий решения, — реши его сначала (кнопки выше).")
+        return
+    await message.answer("Генерирую черновик…")
+    try:
+        await _request_approval(category=category)
+    except Exception:
+        logger.exception("Manual draft request failed")
+        await message.answer("⚠️ Не получилось сгенерировать черновик — смотри логи.")
 
 
 def _approval_keyboard() -> InlineKeyboardMarkup:
@@ -450,7 +508,7 @@ async def handle_admin_photo(message: Message) -> None:
 
 @dp.callback_query(F.data == "approve_post")
 async def cb_approve_post(callback: CallbackQuery) -> None:
-    global _pending_draft, _pending_photo
+    global _pending_draft, _pending_photo, _pending_slot_category
     if not _is_admin_callback(callback):
         await callback.answer("Только из админ-чата")
         return
@@ -459,11 +517,17 @@ async def cb_approve_post(callback: CallbackQuery) -> None:
         return
     post = _pending_draft
     photo = _pending_photo
+    category = _pending_slot_category
     _pending_draft = None
     _pending_photo = None
+    _pending_slot_category = None
     try:
-        await _send_generated_post(config.channel_id, post, photo=photo)
+        sent = await _send_generated_post(config.channel_id, post, photo=photo)
         save_last_post_at(_POST_STATE_PATH, datetime.now(timezone.utc), title=_post_title(post))
+        record_published_post(
+            _HISTORY_PATH, category=category, summary=_post_history_summary(post), published_at=datetime.now(timezone.utc).isoformat()
+        )
+        await _pin_if_intro(category, sent)
     except Exception:
         logger.exception("Failed to publish approved draft")
         await callback.answer("⚠️ Не получилось опубликовать — смотри логи.", show_alert=True)
@@ -664,8 +728,9 @@ _ADMIN_COMMANDS = _DEFAULT_COMMANDS + [
     BotCommand(command="feedback", description="Замечание по стилю — учту в следующих постах"),
     BotCommand(command="feedbacklist", description="Список замечаний"),
     BotCommand(command="removefeedback", description="Удалить замечание"),
-    BotCommand(command="preview", description="Предпросмотр (можно: poll/feature/personal)"),
-    BotCommand(command="postnow", description="Опубликовать сейчас (можно: poll/feature/personal)"),
+    BotCommand(command="draft", description="Запросить черновик на ревью (можно: poll/feature/personal/intro)"),
+    BotCommand(command="preview", description="Предпросмотр (можно: poll/feature/personal/intro)"),
+    BotCommand(command="postnow", description="Опубликовать сейчас (можно: poll/feature/personal/intro)"),
     BotCommand(command="pause", description="Приостановить автопостинг"),
     BotCommand(command="resume", description="Возобновить автопостинг"),
     BotCommand(command="status", description="Статус бота"),
