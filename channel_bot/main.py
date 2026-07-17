@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 
 from aiogram import Bot, Dispatcher, F
 from aiogram.client.default import DefaultBotProperties
@@ -51,18 +53,86 @@ _CATEGORY_LABELS = {"poll": "опрос", "feature": "про фичу", "persona
 # Россия не переходит на летнее время — фиксированный оффсет ок, без tzdata.
 _MSK_OFFSET_HOURS = 3
 
+# По просьбе — черновик на апрув должен приходить ЗАРАНЕЕ, а не ровно в
+# момент поста, чтобы оставалось время посмотреть/поправить до целевого
+# времени. Действует только в режиме ревью — в автономном режиме смотреть
+# черновик некому, публикуем ровно в слот.
+_APPROVAL_LEAD_MINUTES = 30
 
-def _next_slot_datetime(now_utc: datetime) -> tuple[datetime, str]:
+_SLOT_OVERRIDES_PATH = "channel_bot/slot_overrides.json"
+_LAST_TRIGGERED_SLOT_PATH = "channel_bot/last_triggered_slot.json"
+
+
+def _next_slot_datetime(now_utc: datetime, *, skip_slot: datetime | None = None) -> tuple[datetime, str]:
     """Ближайший следующий слот (строго после now_utc) из _DAILY_SLOTS —
-    сегодняшний, если ещё не наступил, иначе первый слот следующих суток."""
+    сегодняшний, если ещё не наступил, иначе первый слот следующих суток.
+    skip_slot — слот, для которого апрув/публикация УЖЕ запрошены в этом
+    цикле (см. _LAST_TRIGGERED_SLOT_PATH) — пропускаем его, даже если сам
+    момент слота ещё не наступил (актуально из-за _APPROVAL_LEAD_MINUTES:
+    апрув мог быть решён админом раньше целевого времени слота)."""
     for day_offset in (0, 1):
         day = now_utc + timedelta(days=day_offset)
         for hour_msk, minute_msk, category in _DAILY_SLOTS:
             slot_dt = day.replace(hour=hour_msk - _MSK_OFFSET_HOURS, minute=minute_msk, second=0, microsecond=0)
             if day_offset == 0 and slot_dt <= now_utc:
                 continue
+            if skip_slot is not None and slot_dt == skip_slot:
+                continue
             return slot_dt, category
     raise AssertionError("unreachable — _DAILY_SLOTS должен быть непустым")
+
+
+def _load_last_triggered_slot() -> datetime | None:
+    path = Path(_LAST_TRIGGERED_SLOT_PATH)
+    if not path.exists():
+        return None
+    try:
+        return datetime.fromisoformat(json.loads(path.read_text(encoding="utf-8"))["slot_at"])
+    except Exception:
+        return None
+
+
+def _save_last_triggered_slot(slot_dt: datetime) -> None:
+    Path(_LAST_TRIGGERED_SLOT_PATH).write_text(json.dumps({"slot_at": slot_dt.isoformat()}), encoding="utf-8")
+
+
+def _load_slot_overrides() -> list[dict]:
+    path = Path(_SLOT_OVERRIDES_PATH)
+    if not path.exists():
+        return []
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+        return list(data) if isinstance(data, list) else []
+    except Exception:
+        return []
+
+
+def _add_slot_override(at: datetime, category: str) -> None:
+    """Разовое переопределение расписания на конкретный момент времени — см.
+    /overridepost. `at` — момент, когда СРАЗУ запускать апрув/публикацию (не
+    момент самого поста): если хочешь заранее с запасом на ревью — вычти
+    _APPROVAL_LEAD_MINUTES сам при вызове, оверрайд эту логику не применяет
+    повторно (в отличие от обычного грид-расписания)."""
+    overrides = _load_slot_overrides()
+    overrides.append({"at": at.isoformat(), "category": category})
+    overrides.sort(key=lambda o: o["at"])
+    Path(_SLOT_OVERRIDES_PATH).write_text(json.dumps(overrides, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def _pop_due_override(now_utc: datetime) -> dict | None:
+    overrides = _load_slot_overrides()
+    if not overrides:
+        return None
+    earliest = overrides[0]
+    if datetime.fromisoformat(earliest["at"]) > now_utc:
+        return None
+    Path(_SLOT_OVERRIDES_PATH).write_text(json.dumps(overrides[1:], ensure_ascii=False, indent=2), encoding="utf-8")
+    return earliest
+
+
+def _next_override_at() -> datetime | None:
+    overrides = _load_slot_overrides()
+    return datetime.fromisoformat(overrides[0]["at"]) if overrides else None
 
 # R-COST: см. shared/rate_limiter.py — защита от одного спамящего "?" в
 # публичном чате обсуждения. По пользователю, не по чату целиком (иначе
@@ -259,8 +329,16 @@ async def cmd_status(message: Message) -> None:
     topics_count = len(load_queue(_QUEUE_PATH))
     stories_count = len(load_queue(_STORY_QUEUE_PATH))
     feedback_count = len(load_feedback(_FEEDBACK_PATH))
-    next_slot_dt, next_category = _next_slot_datetime(datetime.now(timezone.utc))
+    now = datetime.now(timezone.utc)
+    next_slot_dt, next_category = _next_slot_datetime(now, skip_slot=_load_last_triggered_slot())
     next_slot_msk = next_slot_dt + timedelta(hours=_MSK_OFFSET_HOURS)
+    override_at = _next_override_at()
+    if override_at is not None and override_at < next_slot_dt:
+        override_msk = override_at + timedelta(hours=_MSK_OFFSET_HOURS)
+        override_line = f"🗓 Оверрайд в очереди — апрув/публикация в {override_msk:%d.%m %H:%M} МСК\n"
+    else:
+        override_line = ""
+    lead_note = f" (черновик придёт за {_APPROVAL_LEAD_MINUTES} мин до этого)" if _effective_require_approval else ""
     last_info = load_last_post_info(_POST_STATE_PATH)
     if last_info:
         ago_hours = round((datetime.now(timezone.utc) - last_info["last_post_at"]).total_seconds() / 3600, 1)
@@ -280,7 +358,8 @@ async def cmd_status(message: Message) -> None:
         f"{mode_line}\n"
         f"{last_line}\n"
         f"📋 Тем в очереди: {topics_count} | 📔 личных историй: {stories_count} | 🗒 замечаний: {feedback_count}\n"
-        f"⏰ Следующий слот: {_CATEGORY_LABELS.get(next_category, next_category)} в {next_slot_msk:%H:%M} МСК\n"
+        f"{override_line}"
+        f"⏰ Следующий слот: {_CATEGORY_LABELS.get(next_category, next_category)} в {next_slot_msk:%H:%M} МСК{lead_note}\n"
         f"💬 Ответы в обсуждении: {'включены' if config.discussion_chat_id else 'выключены (DISCUSSION_CHAT_ID не задан)'}"
     )
 
@@ -454,6 +533,42 @@ async def cmd_draft(message: Message, command: CommandObject) -> None:
     except Exception:
         logger.exception("Manual draft request failed")
         await message.answer("⚠️ Не получилось сгенерировать черновик — смотри логи.")
+
+
+@dp.message(Command("overridepost"), F.func(_admin_filter))
+async def cmd_overridepost(message: Message, command: CommandObject) -> None:
+    # R-CONVENIENCE: разово подменить конкретный слот расписания (например,
+    # интро-пост вместо обычного опроса в конкретный день) — не трогая
+    # _DAILY_SLOTS насовсем. Время — момент самого ПОСТА (не апрува), лид-тайм
+    # (_APPROVAL_LEAD_MINUTES) вычитается автоматически, как и для обычного
+    # грид-расписания — админу не нужно считать его вручную.
+    parts = (command.args or "").split()
+    if len(parts) != 3:
+        await message.answer(
+            "Формат: /overridepost 2026-07-18 10:00 intro\n"
+            "Дата и время — МСК, время самого поста (не апрува). Темы: poll|feature|personal|intro"
+        )
+        return
+    date_str, time_str, category = parts
+    category = category.lower()
+    if category not in _CATEGORY_LABELS:
+        await message.answer(f"Неизвестная тема «{category}». Форматы: poll|feature|personal|intro")
+        return
+    try:
+        post_at_msk = datetime.strptime(f"{date_str} {time_str}", "%Y-%m-%d %H:%M")
+    except ValueError:
+        await message.answer("Не разобрал дату/время. Формат: /overridepost 2026-07-18 10:00 intro")
+        return
+    post_at_utc = post_at_msk.replace(tzinfo=timezone.utc) - timedelta(hours=_MSK_OFFSET_HOURS)
+    if _effective_require_approval:
+        trigger_at_utc = post_at_utc - timedelta(minutes=_APPROVAL_LEAD_MINUTES)
+        approval_msk = post_at_msk - timedelta(minutes=_APPROVAL_LEAD_MINUTES)
+        lead_note = f" (черновик на апрув придёт в {approval_msk:%H:%M} МСК)"
+    else:
+        trigger_at_utc = post_at_utc
+        lead_note = ""
+    _add_slot_override(trigger_at_utc, category)
+    await message.answer(f"✅ На {date_str} {time_str} МСК запланирован пост: {_CATEGORY_LABELS[category]}{lead_note}")
 
 
 def _approval_keyboard() -> InlineKeyboardMarkup:
@@ -653,13 +768,42 @@ async def post_scheduled_content() -> None:
         if _posting_paused:
             await asyncio.sleep(60)
             continue
+        now = datetime.now(timezone.utc)
+
+        # Разовые оверрайды (см. /overridepost) идут ПЕРЕД обычным гридом —
+        # например, интро-пост вместо обычного слота в конкретный день.
+        due_override = _pop_due_override(now)
+        if due_override is not None:
+            try:
+                if _effective_require_approval:
+                    await _request_approval(category=due_override["category"])
+                else:
+                    await _publish_generated_post(category=due_override["category"])
+            except Exception:
+                logger.exception("Failed to handle slot override")
+                await asyncio.sleep(_RETRY_DELAY_SECONDS)
+            continue
+
         # R-CONVENIENCE: расписание чисто по времени суток (_DAILY_SLOTS), не
         # "N часов после последнего поста" — если бот перезапустили и слот
         # уже прошёл, он просто пропускается (не постим задним числом), тот
         # же принцип, что раньше давал избежать спама после рестарта.
-        now = datetime.now(timezone.utc)
-        slot_dt, category = _next_slot_datetime(now)
-        wait_seconds = (slot_dt - now).total_seconds()
+        last_triggered = _load_last_triggered_slot()
+        slot_dt, category = _next_slot_datetime(now, skip_slot=last_triggered)
+
+        next_override_at = _next_override_at()
+        if next_override_at is not None and next_override_at < slot_dt:
+            # Ближайший оверрайд наступит раньше обычного слота — ждём его,
+            # а не обычный грид.
+            wait_seconds = (next_override_at - now).total_seconds()
+            await asyncio.sleep(max(1.0, min(wait_seconds, _PENDING_DRAFT_RECHECK_SECONDS)))
+            continue
+
+        # По просьбе — черновик на апрув приходит за _APPROVAL_LEAD_MINUTES
+        # до целевого времени поста, не ровно в момент поста (в автономном
+        # режиме смотреть черновик некому — публикуем ровно в слот).
+        trigger_dt = slot_dt - timedelta(minutes=_APPROVAL_LEAD_MINUTES) if _effective_require_approval else slot_dt
+        wait_seconds = (trigger_dt - now).total_seconds()
         if wait_seconds > 0:
             await asyncio.sleep(min(wait_seconds, _PENDING_DRAFT_RECHECK_SECONDS))
             continue
@@ -671,6 +815,11 @@ async def post_scheduled_content() -> None:
                 # уйдёт в ветку выше.
             else:
                 await _publish_generated_post(category=category)
+            # Отмечаем слот обработанным СРАЗУ после запроса апрува (не после
+            # решения админа) — иначе если админ решит рано (в пределах
+            # 30-минутного окна до slot_dt), следующая итерация цикла увидит
+            # тот же slot_dt всё ещё в будущем и запросит апрув повторно.
+            _save_last_triggered_slot(slot_dt)
         except Exception:
             logger.exception("Failed to publish scheduled post")
             await asyncio.sleep(_RETRY_DELAY_SECONDS)
@@ -736,6 +885,7 @@ _ADMIN_COMMANDS = _DEFAULT_COMMANDS + [
     BotCommand(command="feedbacklist", description="Список замечаний"),
     BotCommand(command="removefeedback", description="Удалить замечание"),
     BotCommand(command="draft", description="Запросить черновик на ревью (можно: poll/feature/personal/intro)"),
+    BotCommand(command="overridepost", description="Разово подменить пост в расписании (дата время тема)"),
     BotCommand(command="preview", description="Предпросмотр (можно: poll/feature/personal/intro)"),
     BotCommand(command="postnow", description="Опубликовать сейчас (можно: poll/feature/personal/intro)"),
     BotCommand(command="pause", description="Приостановить автопостинг"),
