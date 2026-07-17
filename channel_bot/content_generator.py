@@ -214,6 +214,33 @@ def _write_poll(llm: LLMClient, topic: str) -> GeneratedPost | None:
     return GeneratedPost(kind="poll", question=question, options=options)
 
 
+_REVISION_SYSTEM_PROMPT = (
+    _SYSTEM_PROMPT
+    + "\n\nТебе дают уже готовый черновик поста и правку от админа канала "
+    "(конкретное замечание, идею или пожелание). Перепиши пост с учётом этой "
+    "правки, по-прежнему соблюдая все правила выше (длина, тон, без "
+    "внутренней механики и т.д.). Если правка расплывчата — истолкуй её в "
+    "духе пожеланий читателя канала, а не буквально дословно."
+)
+
+
+def revise_post(llm: LLMClient, original: GeneratedPost, feedback: str) -> GeneratedPost:
+    """Переписывает текстовый черновик с учётом правки админа (см. кнопку
+    "Предложить правки" в main.py). Опросы не ревизуются здесь — main.py
+    отсекает эту кнопку для kind="poll" ещё до вызова."""
+    text = llm.chat(
+        [
+            {"role": "system", "content": _REVISION_SYSTEM_PROMPT},
+            {
+                "role": "user",
+                "content": f"Черновик поста:\n{original.text}\n\nПравка от админа:\n{feedback}",
+            },
+        ],
+        max_tokens=_POST_MAX_TOKENS,
+    )
+    return GeneratedPost(kind="text", text=text)
+
+
 def _generate_post(llm: LLMClient, topic: str, beta_invite_url: str = "") -> GeneratedPost:
     if random.random() < _POLL_PROBABILITY:
         poll = _write_poll(llm, topic)

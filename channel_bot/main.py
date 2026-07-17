@@ -10,7 +10,7 @@ from aiogram.enums import ParseMode
 from aiogram.filters import Command, CommandObject
 from aiogram.types import BotCommand, BotCommandScopeChat, CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message
 
-from channel_bot.content_generator import GeneratedPost, generate_next_post
+from channel_bot.content_generator import GeneratedPost, generate_next_post, revise_post
 from channel_bot.content_queue import append_topic, load_queue, save_queue
 from channel_bot.post_state import load_last_post_info, save_last_post_at, seconds_until_next_post
 from shared.config import ChannelBotConfig, LLMConfig
@@ -54,6 +54,15 @@ _RETRY_DELAY_SECONDS = 30 * 60
 # черновиком, он просто сгенерирует новый на следующем цикле, старая тема
 # из очереди уже израсходована и это ок (не критичная потеря).
 _pending_draft: GeneratedPost | None = None
+# file_id фото, присланного админом к текущему черновику (см.
+# handle_admin_photo) — публикуется вместе с текстом при апруве. Сбрасывается
+# при каждом новом черновике (реролл/расписание), чтобы старое фото не
+# случайно приклеилось к другому посту.
+_pending_photo: str | None = None
+# True между нажатием «✏️ Предложить правки» и следующим текстовым
+# сообщением админа — следующее текстовое сообщение в админ-чате трактуется
+# как правка к _pending_draft, а не игнорируется (см. handle_admin_feedback).
+_awaiting_feedback: bool = False
 _PENDING_DRAFT_RECHECK_SECONDS = 5 * 60
 _effective_require_approval = config.require_approval and bool(config.admin_chat_id)
 if config.require_approval and not config.admin_chat_id:
@@ -136,7 +145,10 @@ async def cmd_status(message: Message) -> None:
     else:
         last_line = "📝 Постов ещё не было"
     if _effective_require_approval:
-        mode_line = "📝 Режим: черновик на ревью" + (" — сейчас есть черновик, ждёт решения" if _pending_draft else "")
+        draft_status = " — сейчас есть черновик, ждёт решения" if _pending_draft else ""
+        photo_status = " (📎 фото прикреплено)" if _pending_photo else ""
+        feedback_status = " (✏️ жду твою правку текстом)" if _awaiting_feedback else ""
+        mode_line = f"📝 Режим: черновик на ревью{draft_status}{photo_status}{feedback_status}"
     else:
         mode_line = "🤖 Режим: полная автономность"
     await message.answer(
@@ -179,9 +191,14 @@ def _post_preview_text(post: GeneratedPost) -> str:
     return post.text
 
 
-async def _send_generated_post(chat_id: str, post: GeneratedPost) -> None:
+async def _send_generated_post(chat_id: str, post: GeneratedPost, photo: str | None = None) -> None:
     if post.kind == "poll":
+        # Telegram-опросы не поддерживают вложенное фото в том же сообщении —
+        # если админ всё же прислал фото к черновику-опросу, тихо игнорируем
+        # его здесь (handle_admin_photo уже предупреждает об этом при приёме).
         await bot.send_poll(chat_id, post.question, post.options, is_anonymous=True)
+    elif photo:
+        await bot.send_photo(chat_id, photo=photo, caption=post.text)
     else:
         await bot.send_message(chat_id, post.text)
 
@@ -244,8 +261,19 @@ def _approval_keyboard() -> InlineKeyboardMarkup:
     )
 
 
+def _reject_followup_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(text="🔄 Новый пост", callback_data="reroll_post"),
+                InlineKeyboardButton(text="✏️ Предложить правки", callback_data="suggest_edit"),
+            ]
+        ]
+    )
+
+
 async def _request_approval() -> None:
-    global _pending_draft
+    global _pending_draft, _pending_photo, _awaiting_feedback
     sync_docs_repo(config.finassist_docs_path)
     post = generate_next_post(
         llm,
@@ -256,9 +284,12 @@ async def _request_approval() -> None:
         beta_invite_url=config.beta_invite_url,
     )
     _pending_draft = post
+    _pending_photo = None
+    _awaiting_feedback = False
+    photo_hint = "\n\n📎 Пришли мне фото, если хочешь прикрепить его к посту." if post.kind == "text" else ""
     await bot.send_message(
         config.admin_chat_id,
-        f"👀 <b>Черновик поста — нужно решение:</b>\n\n{_post_preview_text(post)}",
+        f"👀 <b>Черновик поста — нужно решение:</b>\n\n{_post_preview_text(post)}{photo_hint}",
         reply_markup=_approval_keyboard(),
     )
 
@@ -267,9 +298,23 @@ def _is_admin_callback(callback: CallbackQuery) -> bool:
     return bool(callback.message) and str(callback.message.chat.id) == config.admin_chat_id
 
 
+@dp.message(F.photo, F.func(_is_admin_chat))
+async def handle_admin_photo(message: Message) -> None:
+    global _pending_photo
+    if _pending_draft is None:
+        await message.reply("Сейчас нет черновика, к которому можно прикрепить фото.")
+        return
+    if _pending_draft.kind == "poll":
+        await message.reply("К опросу нельзя прикрепить фото — это ограничение Telegram-опросов.")
+        return
+    # message.photo — несколько размеров одного фото, последний — самый крупный.
+    _pending_photo = message.photo[-1].file_id
+    await message.reply("📎 Фото прикреплено к черновику. Нажми «Опубликовать», когда будешь готов.")
+
+
 @dp.callback_query(F.data == "approve_post")
 async def cb_approve_post(callback: CallbackQuery) -> None:
-    global _pending_draft
+    global _pending_draft, _pending_photo
     if not _is_admin_callback(callback):
         await callback.answer("Только из админ-чата")
         return
@@ -277,29 +322,109 @@ async def cb_approve_post(callback: CallbackQuery) -> None:
         await callback.answer("Черновика уже нет — возможно, кто-то уже решил.")
         return
     post = _pending_draft
+    photo = _pending_photo
     _pending_draft = None
+    _pending_photo = None
     try:
-        await _send_generated_post(config.channel_id, post)
+        await _send_generated_post(config.channel_id, post, photo=photo)
         save_last_post_at(_POST_STATE_PATH, datetime.now(timezone.utc), title=_post_title(post))
     except Exception:
         logger.exception("Failed to publish approved draft")
         await callback.answer("⚠️ Не получилось опубликовать — смотри логи.", show_alert=True)
         return
     if callback.message:
-        await callback.message.edit_text(f"✅ Опубликовано:\n\n{_post_preview_text(post)}")
+        await callback.message.edit_text(f"✅ Опубликовано{' (с фото)' if photo else ''}:\n\n{_post_preview_text(post)}")
     await callback.answer("Опубликовано")
 
 
 @dp.callback_query(F.data == "reject_post")
 async def cb_reject_post(callback: CallbackQuery) -> None:
-    global _pending_draft
+    global _awaiting_feedback
+    if not _is_admin_callback(callback):
+        await callback.answer("Только из админ-чата")
+        return
+    if _pending_draft is None:
+        await callback.answer("Черновика уже нет — возможно, кто-то уже решил.")
+        return
+    # R-CONVENIENCE: по просьбе — не выбрасывать черновик молча и не решать
+    # за админа между "новый" и "поправить" — черновик остаётся в
+    # _pending_draft, чтобы кнопка «Предложить правки» могла его переписать.
+    _awaiting_feedback = False
+    if callback.message:
+        await callback.message.edit_text(
+            f"🗑 Ок, этот вариант не публикуем. Что дальше?\n\n{_post_preview_text(_pending_draft)}",
+            reply_markup=_reject_followup_keyboard(),
+        )
+    await callback.answer("Выбери, что делать дальше")
+
+
+@dp.callback_query(F.data == "reroll_post")
+async def cb_reroll_post(callback: CallbackQuery) -> None:
+    global _pending_draft, _pending_photo, _awaiting_feedback
     if not _is_admin_callback(callback):
         await callback.answer("Только из админ-чата")
         return
     _pending_draft = None
+    _pending_photo = None
+    _awaiting_feedback = False
     if callback.message:
-        await callback.message.edit_text("🗑 Черновик пропущен — следующий будет по расписанию.")
-    await callback.answer("Пропущено")
+        await callback.message.edit_text("🔄 Черновик пропущен — готовлю другой вариант…")
+    await callback.answer("Готовлю новый вариант")
+    try:
+        await _request_approval()
+    except Exception:
+        logger.exception("Failed to generate replacement draft after reroll")
+        await bot.send_message(
+            config.admin_chat_id, "⚠️ Не получилось сгенерировать новый вариант — попробуй /postnow позже или проверь логи."
+        )
+
+
+@dp.callback_query(F.data == "suggest_edit")
+async def cb_suggest_edit(callback: CallbackQuery) -> None:
+    global _awaiting_feedback
+    if not _is_admin_callback(callback):
+        await callback.answer("Только из админ-чата")
+        return
+    if _pending_draft is None:
+        await callback.answer("Черновика уже нет — возможно, кто-то уже решил.")
+        return
+    if _pending_draft.kind == "poll":
+        # Свободная правка текстом плохо определена для опроса (вопрос +
+        # варианты, а не связный текст) — проще перегенерировать целиком.
+        await callback.answer("Правки пока доступны только для текстовых постов — жми «Новый пост».", show_alert=True)
+        return
+    _awaiting_feedback = True
+    if callback.message:
+        await callback.message.edit_text(
+            "✏️ Напиши, что поправить или какую идею добавить, — перепишу пост с учётом этого.\n\n"
+            f"Черновик, который правим:\n\n{_post_preview_text(_pending_draft)}"
+        )
+    await callback.answer("Жду твою правку текстом")
+
+
+@dp.message(F.text, F.func(_is_admin_chat))
+async def handle_admin_feedback(message: Message) -> None:
+    global _pending_draft, _awaiting_feedback
+    if not _awaiting_feedback or _pending_draft is None:
+        # Не режим правки — это не наш хендлер, молча пропускаем (в
+        # админ-чате нет другого обработчика произвольного текста).
+        return
+    feedback = (message.text or "").strip()
+    if not feedback:
+        return
+    _awaiting_feedback = False
+    await bot.send_chat_action(message.chat.id, "typing")
+    try:
+        revised = revise_post(llm, _pending_draft, feedback)
+    except Exception:
+        logger.exception("Failed to revise draft from admin feedback")
+        await message.reply("⚠️ Не получилось переписать пост — попробуй ещё раз или жми «Новый пост» после следующего /postnow.")
+        return
+    _pending_draft = revised
+    await message.reply(
+        f"✏️ <b>Переписал с учётом правки:</b>\n\n{_post_preview_text(revised)}",
+        reply_markup=_approval_keyboard(),
+    )
 
 
 async def post_scheduled_content() -> None:
