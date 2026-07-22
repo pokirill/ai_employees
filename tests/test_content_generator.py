@@ -2,7 +2,17 @@ from __future__ import annotations
 
 import pytest
 
-from channel_bot.content_generator import _chat_within_length_limit, generate_next_post
+from channel_bot.content_generator import (
+    _chat_within_length_limit,
+    _collect_release_notes_entries,
+    generate_clarifying_questions,
+    generate_compose_post,
+    generate_feedback_metrics_post,
+    generate_next_post,
+    generate_release_notes_post,
+    revise_post,
+)
+from channel_bot.content_generator import GeneratedPost
 from channel_bot.content_queue import load_queue, save_queue
 
 
@@ -290,3 +300,199 @@ def test_chat_within_length_limit_gives_up_after_max_attempts():
 
     assert text == long_text  # не блокируем публикацию — админ увидит длинный черновик на ревью
     assert len(llm.calls) == 3  # 1 первая попытка + 2 повтора (_LENGTH_RETRY_ATTEMPTS)
+
+
+def _write_changelog(path, *titles_and_bodies):
+    lines = []
+    for title, body in titles_and_bodies:
+        lines.append(f"- **[{title}]**\n{body}\n")
+    path.write_text("\n".join(lines), encoding="utf-8")
+
+
+def test_collect_release_notes_entries_gathers_multiple_up_to_max(tmp_path):
+    changelog_path = tmp_path / "AI_CHANGELOG.md"
+    _write_changelog(
+        changelog_path,
+        ("Фича А", "Описание А"),
+        ("Фича Б", "Описание Б"),
+        ("Фича В", "Описание В"),
+    )
+    used_state_path = str(tmp_path / "used.json")
+
+    entries = _collect_release_notes_entries(_FakeLLM(), str(changelog_path), used_state_path, dry_run=False, max_items=2)
+
+    assert [e["title"] for e in entries] == ["Фича А", "Фича Б"]
+
+
+def test_collect_release_notes_entries_leaves_overflow_for_next_week(tmp_path):
+    changelog_path = tmp_path / "AI_CHANGELOG.md"
+    _write_changelog(changelog_path, ("Фича А", "А"), ("Фича Б", "Б"), ("Фича В", "В"))
+    used_state_path = str(tmp_path / "used.json")
+
+    _collect_release_notes_entries(_FakeLLM(), str(changelog_path), used_state_path, dry_run=False, max_items=2)
+    second_week = _collect_release_notes_entries(_FakeLLM(), str(changelog_path), used_state_path, dry_run=False, max_items=2)
+
+    assert [e["title"] for e in second_week] == ["Фича В"]
+
+
+def test_collect_release_notes_entries_dry_run_does_not_mark_used(tmp_path):
+    changelog_path = tmp_path / "AI_CHANGELOG.md"
+    _write_changelog(changelog_path, ("Фича А", "А"), ("Фича Б", "Б"))
+    used_state_path = str(tmp_path / "used.json")
+
+    _collect_release_notes_entries(_FakeLLM(), str(changelog_path), used_state_path, dry_run=True, max_items=5)
+
+    from channel_bot.changelog_entries import load_used_titles
+
+    assert load_used_titles(used_state_path) == set()
+
+
+def test_generate_release_notes_post_returns_none_when_no_entries(tmp_path):
+    used_state_path = str(tmp_path / "used.json")
+
+    post = generate_release_notes_post(_FakeLLM(), str(tmp_path / "missing_changelog.md"), used_state_path)
+
+    assert post is None
+
+
+def test_generate_release_notes_post_includes_all_collected_entries_in_prompt(tmp_path):
+    changelog_path = tmp_path / "AI_CHANGELOG.md"
+    _write_changelog(changelog_path, ("Фича А", "Описание А"), ("Фича Б", "Описание Б"))
+    used_state_path = str(tmp_path / "used.json")
+    llm = _FakeLLM()
+
+    post = generate_release_notes_post(llm, str(changelog_path), used_state_path)
+
+    assert post is not None
+    assert post.kind == "text"
+    user_content = llm.calls[-1][1]["content"]
+    assert "Фича А" in user_content
+    assert "Фича Б" in user_content
+
+
+def test_generate_feedback_metrics_post_mentions_delta_when_given():
+    llm = _FakeLLM()
+
+    generate_feedback_metrics_post(llm, 150, 12)
+
+    user_content = llm.calls[-1][1]["content"]
+    assert "150" in user_content
+    assert "+12" in user_content
+
+
+def test_generate_feedback_metrics_post_omits_delta_when_none():
+    llm = _FakeLLM()
+
+    generate_feedback_metrics_post(llm, 150, None)
+
+    user_content = llm.calls[-1][1]["content"]
+    assert "150" in user_content
+    assert "нет" in user_content.lower()
+
+
+def test_generate_clarifying_questions_returns_empty_when_ready():
+    llm = _FakeLLM(responses=["ГОТОВО"])
+
+    questions = generate_clarifying_questions(llm, "icon_story", qa_pairs=[])
+
+    assert questions == []
+
+
+def test_generate_clarifying_questions_parses_and_caps_at_four():
+    raw = "\n".join(f"ВОПРОС: Вопрос {i}?" for i in range(6))
+    llm = _FakeLLM(responses=[raw])
+
+    questions = generate_clarifying_questions(llm, "team_roster", qa_pairs=[])
+
+    assert len(questions) == 4
+    assert questions[0] == "Вопрос 0?"
+
+
+def test_generate_clarifying_questions_fails_open_on_unparseable_response():
+    llm = _FakeLLM(responses=["что-то невнятное, не тот формат"])
+
+    questions = generate_clarifying_questions(llm, "icon_story", qa_pairs=[])
+
+    assert questions == []
+
+
+def test_generate_clarifying_questions_includes_prior_qa_in_prompt():
+    llm = _FakeLLM(responses=["ГОТОВО"])
+    qa_pairs = [("Кто предложил идею?", "Дизайнер Аня")]
+
+    generate_clarifying_questions(llm, "icon_story", qa_pairs=qa_pairs)
+
+    user_content = llm.calls[-1][1]["content"]
+    assert "Дизайнер Аня" in user_content
+
+
+def test_generate_compose_post_icon_story_includes_facts_and_respects_own_length_limit():
+    llm = _FakeLLM(responses=["а" * 500])  # >350 (обычный лимит), но <700 (лимит icon_story)
+    qa_pairs = [("Сколько было вариантов?", "Три варианта, один шуточный")]
+
+    post = generate_compose_post(llm, "icon_story", qa_pairs)
+
+    assert post.kind == "text"
+    assert len(llm.calls) == 1  # 500 < 700 — retry не нужен
+    user_content = llm.calls[-1][1]["content"]
+    assert "Три варианта, один шуточный" in user_content
+
+
+def test_generate_compose_post_team_roster_respects_larger_length_limit():
+    llm = _FakeLLM(responses=["а" * 1000])  # >700, но <1500 (лимит team_roster)
+    qa_pairs = [("Кто в команде?", "Аня — дизайн, Кирилл — продукт")]
+
+    post = generate_compose_post(llm, "team_roster", qa_pairs)
+
+    assert post.kind == "text"
+    assert len(llm.calls) == 1
+
+
+def test_revise_post_icon_story_uses_own_length_limit_not_regular_350():
+    # Регрессия того же класса, что уже дважды ловили для "intro" (см.
+    # _COMPOSE_POST_SPECS в content_generator.py): без явной ветки для
+    # icon_story/team_roster правка отката бы черновик к обычным 350
+    # символам, здесь 500 символов не должно триггерить повтор.
+    llm = _FakeLLM(responses=["а" * 500])
+    original = GeneratedPost(kind="text", text="старый черновик")
+
+    revise_post(llm, original, "сделай теплее", category="icon_story")
+
+    assert len(llm.calls) == 1
+
+
+def test_revise_post_default_category_still_uses_regular_350_limit():
+    llm = _FakeLLM(responses=["а" * 500, "а" * 200])
+    original = GeneratedPost(kind="text", text="старый черновик")
+
+    revise_post(llm, original, "сделай теплее", category=None)
+
+    assert len(llm.calls) == 2  # 500 > 350 — должен был сработать retry
+
+
+def test_generate_clarifying_questions_includes_chat_context_when_given():
+    llm = _FakeLLM(responses=["ГОТОВО"])
+
+    generate_clarifying_questions(llm, "team_roster", qa_pairs=[], chat_context="Кирилл: у нас в команде теперь и Паша на бэкенде")
+
+    user_content = llm.calls[-1][1]["content"]
+    assert "Паша на бэкенде" in user_content
+
+
+def test_generate_clarifying_questions_omits_chat_context_block_when_empty():
+    llm = _FakeLLM(responses=["ГОТОВО"])
+
+    generate_clarifying_questions(llm, "icon_story", qa_pairs=[], chat_context="")
+
+    user_content = llm.calls[-1][1]["content"]
+    assert "Выдержка из чата команды" not in user_content
+
+
+def test_generate_compose_post_includes_chat_context_alongside_qa():
+    llm = _FakeLLM(responses=["готовый пост"])
+
+    generate_compose_post(llm, "icon_story", qa_pairs=[("Кто предложил?", "Аня")], chat_context="Аня: гляньте новый вариант иконки")
+
+    user_content = llm.calls[-1][1]["content"]
+    assert "Аня: гляньте новый вариант иконки" in user_content
+    assert "Аня" in user_content

@@ -7,8 +7,17 @@ from pathlib import Path
 # R-COST: пассивный буфер сообщений чата команды — ноль вызовов LLM на
 # запись, ноль на каждое сообщение. Читается ЦЕЛИКОМ раз в неделю в
 # sprint_loop как доп. контекст для оценки эффективности/планирования (см.
-# team_bot/main.py) — единственное место, где это реально стоит токенов.
+# team_bot/main.py). Только team_bot реально состоит в командном чате и
+# пишет сюда (см. middleware в team_bot/main.py) — но файл лежит в общем
+# репо, и channel_bot ЧИТАЕТ его же (см. /compose в channel_bot/main.py),
+# чтобы иметь тот же контекст команды, не будучи сам участником чата.
 _MAX_ENTRIES = 400
+
+# Единый путь к файлу лога — раньше был захардкожен отдельно в team_bot и
+# только team_bot его знал; теперь используется двумя процессами (team_bot
+# пишет, channel_bot читает), поэтому вынесен сюда как единый источник
+# правды, чтобы они не могли разъехаться по путям.
+DEFAULT_LOG_PATH = "team_bot_chat_log.json"
 
 
 def _load(path: str) -> list[dict]:
@@ -26,6 +35,13 @@ def append_chat_message(path: str, *, author: str, text: str) -> None:
     items = _load(path)
     items.append({"author": author, "text": text, "at": datetime.now(timezone.utc).isoformat()})
     Path(path).write_text(json.dumps(items[-_MAX_ENTRIES:], ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def all_messages(path: str) -> list[dict]:
+    """Публичная обёртка над _load — для читателей, которым нужен весь
+    буфер целиком (см. channel_bot/main.py /compose), а не срез с даты, как
+    у messages_since (см. team_bot sprint_loop)."""
+    return _load(path)
 
 
 def messages_since(path: str, since: datetime) -> list[dict]:

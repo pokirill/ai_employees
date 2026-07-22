@@ -75,6 +75,14 @@ class TeamBotConfig:
 class ChannelBotConfig:
     telegram_token: str = field(default_factory=lambda: _require("CHANNEL_BOT_TOKEN"))
     channel_id: str = field(default_factory=lambda: _require("CHANNEL_ID"))
+    # Второй, отдельный канал "про нас как команду" — тот же бот, тот же
+    # процесс/контент-пайплайн, другой chat_id (см. main.py: /postnow team,
+    # /preview team, /draft team). Пусто → команды с "team" честно отвечают,
+    # что канал не настроен, вместо попытки постить в channel_id по ошибке.
+    # Не входит в _WEEKLY_SLOTS — сознательно НЕ автопостится по расписанию,
+    # пока не появится ручная обкатка формата (см. main.py — тот же принцип
+    # осторожности, что и при первом запуске основного channel_bot).
+    team_channel_id: str = field(default_factory=lambda: _optional("TEAM_CHANNEL_ID"))
     discussion_chat_id: str = field(default_factory=lambda: _optional("DISCUSSION_CHAT_ID"))
     finassist_docs_path: str = field(default_factory=lambda: _require("FINASSIST_DOCS_PATH"))
     # Чат, откуда разрешены админ-команды (/postnow, /queue, /status,

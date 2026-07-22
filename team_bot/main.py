@@ -13,7 +13,7 @@ from aiogram.enums import ParseMode
 from aiogram.filters import Command, CommandObject
 from aiogram.types import BotCommand, InlineKeyboardButton, InlineKeyboardMarkup, Message, WebAppInfo
 
-from shared.chat_log import append_chat_message, format_for_prompt, messages_since
+from shared.chat_log import DEFAULT_LOG_PATH, append_chat_message, format_for_prompt, messages_since
 from shared.config import LLMConfig, TaskBoardConfig, TeamBotConfig
 from shared.context_heuristic import question_needs_project_context
 from shared.docs_context import load_project_context, sync_docs_repos, topic_context_files
@@ -45,7 +45,7 @@ tasks_store = TaskStore(board_config.db_path)
 # на чат, чтобы один болтливый чат не сжёг весь бюджет LLM.
 _rate_limiter = SlidingWindowLimiter(max_calls=config.max_questions_per_hour, window_seconds=3600)
 
-_CHAT_LOG_PATH = "team_bot_chat_log.json"
+_CHAT_LOG_PATH = DEFAULT_LOG_PATH
 
 # R-COST: контекст проекта (Docs/*.md обоих репо) — не на каждый вопрос, а
 # только когда похоже, что он реально нужен (см. question_needs_project_context).

@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -10,13 +11,32 @@ from aiogram import Bot, Dispatcher, F
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
 from aiogram.filters import Command, CommandObject
-from aiogram.types import BotCommand, BotCommandScopeChat, CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message
+from aiogram.types import (
+    BotCommand,
+    BotCommandScopeChat,
+    CallbackQuery,
+    ChatMemberUpdated,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    Message,
+)
 
-from channel_bot.content_generator import GeneratedPost, generate_intro_post, generate_next_post, generate_post_for_category, revise_post
+from channel_bot.content_generator import (
+    GeneratedPost,
+    generate_clarifying_questions,
+    generate_compose_post,
+    generate_feedback_metrics_post,
+    generate_intro_post,
+    generate_next_post,
+    generate_post_for_category,
+    revise_post,
+)
 from channel_bot.content_queue import append_topic, load_queue, save_queue
 from channel_bot.feedback_store import add_feedback, load_feedback, remove_feedback
 from channel_bot.post_history import record_published_post
 from channel_bot.post_state import load_last_post_info, save_last_post_at
+from channel_bot.subscriber_snapshot import load_subscriber_snapshot, save_subscriber_snapshot
+from shared.chat_log import DEFAULT_LOG_PATH, all_messages, format_for_prompt
 from shared.config import ChannelBotConfig, LLMConfig
 from shared.docs_context import load_project_context, sync_docs_repo
 from shared.llm_client import LLMClient
@@ -38,18 +58,50 @@ _POST_STATE_PATH = "channel_bot/last_post_state.json"
 _FEEDBACK_PATH = "channel_bot/feedback_log.json"
 _HISTORY_PATH = "channel_bot/post_history_log.json"
 
-# По просьбе — 2-3 поста в день с ЗАКРЕПЛЁННОЙ темой на слот вместо случайного
-# формата каждый раз (было: 1 пост/сутки, формат — рулетка). Время — МСК,
-# час дня выбран по общей практике для лайфстайл/финансового контента (утро —
-# лёгкое вовлечение, обед — основной продуктовый контент, вечер — самое
-# активное время для реакций/комментариев). Список отсортирован по времени
-# суток — см. _next_slot_datetime, порядок важен.
-_DAILY_SLOTS: list[tuple[int, int, str]] = [
-    (10, 0, "poll"),
-    (14, 30, "feature"),
-    (19, 30, "personal"),
+# Пересмотрено по просьбе — 2-3 поста В ДЕНЬ оказались избыточны на старте
+# (некому/незачем читать и сочинять так часто без аудитории, см. Кирилл: "и
+# читать замучаешься, и сочинять" + "аудитории ещё нет, увеличить всегда
+# успеем"): вместо ежедневного грида — фиксированные дни недели, по аналогии
+# с тренировками (пн/ср/сб), с ЗАКРЕПЛЁННОЙ темой за каждым днём, а не
+# случайной. weekday: 0=понедельник ... 5=суббота (см. date.weekday()).
+# Одно время на все три дня (полдень МСК) — было не так важно как сами дни,
+# при желании поменять — просто другое число здесь.
+_WEEKLY_SLOTS: list[tuple[int, int, int, str]] = [
+    (0, 12, 0, "feedback_metrics"),  # понедельник — фидбек + отчёт о метриках
+    (2, 12, 0, "feature"),  # среда — полезный для аудитории пост
+    (5, 12, 0, "release_notes"),  # суббота — релиз-ноуты за неделю
 ]
-_CATEGORY_LABELS = {"poll": "опрос", "feature": "про фичу", "personal": "личная история", "intro": "закреплённый интро-пост"}
+_CATEGORY_LABELS = {
+    "poll": "опрос",
+    "feature": "про фичу",
+    "personal": "личная история",
+    "feedback_metrics": "фидбек и метрики",
+    "release_notes": "релиз-ноуты",
+    "intro": "закреплённый интро-пост",
+    "icon_story": "история про иконку",
+    "team_roster": "кто мы (команда)",
+}
+# Строка-подсказка форматов для сообщений команд — одно место, чтобы не
+# рассинхронизировать несколько скопипащенных литералов при добавлении новой
+# категории (уже случалось бы при добавлении feedback_metrics/release_notes).
+_CATEGORY_ARG_HINT = "poll|feature|personal|feedback_metrics|release_notes|intro"
+
+
+def _parse_target(raw_args: str) -> tuple[str, str]:
+    """Первое слово аргументов команды может быть "team" — тогда цель "
+    команда-канал (config.team_channel_id), а не основной. Возвращает
+    ("team"|"main", остаток_строки) — остаток разбирается вызывающим кодом
+    как обычно (категория). Команда-канал НЕ входит в _WEEKLY_SLOTS
+    (сознательно не автопостится) — доступен только через /postnow team,
+    /preview team, /draft team."""
+    parts = raw_args.strip().split(maxsplit=1)
+    if parts and parts[0].lower() == "team":
+        return "team", (parts[1] if len(parts) > 1 else "")
+    return "main", raw_args.strip()
+
+
+def _target_channel_id(target: str) -> str:
+    return config.team_channel_id if target == "team" else config.channel_id
 # Россия не переходит на летнее время — фиксированный оффсет ок, без tzdata.
 _MSK_OFFSET_HOURS = 3
 
@@ -64,22 +116,27 @@ _LAST_TRIGGERED_SLOT_PATH = "channel_bot/last_triggered_slot.json"
 
 
 def _next_slot_datetime(now_utc: datetime, *, skip_slot: datetime | None = None) -> tuple[datetime, str]:
-    """Ближайший следующий слот (строго после now_utc) из _DAILY_SLOTS —
-    сегодняшний, если ещё не наступил, иначе первый слот следующих суток.
-    skip_slot — слот, для которого апрув/публикация УЖЕ запрошены в этом
-    цикле (см. _LAST_TRIGGERED_SLOT_PATH) — пропускаем его, даже если сам
-    момент слота ещё не наступил (актуально из-за _APPROVAL_LEAD_MINUTES:
-    апрув мог быть решён админом раньше целевого времени слота)."""
-    for day_offset in (0, 1):
+    """Ближайший следующий слот (строго после now_utc) из _WEEKLY_SLOTS —
+    перебирает ближайшие 8 суток (с запасом на полную неделю + 1), а не
+    только "сегодня/завтра" как в старом ежедневном гриде, т.к. следующий
+    слот теперь может быть через несколько дней (например, из пятницы до
+    понедельника). skip_slot — слот, для которого апрув/публикация УЖЕ
+    запрошены в этом цикле (см. _LAST_TRIGGERED_SLOT_PATH) — пропускаем его,
+    даже если сам момент слота ещё не наступил (актуально из-за
+    _APPROVAL_LEAD_MINUTES: апрув мог быть решён админом раньше целевого
+    времени слота)."""
+    for day_offset in range(8):
         day = now_utc + timedelta(days=day_offset)
-        for hour_msk, minute_msk, category in _DAILY_SLOTS:
+        for weekday, hour_msk, minute_msk, category in _WEEKLY_SLOTS:
+            if day.weekday() != weekday:
+                continue
             slot_dt = day.replace(hour=hour_msk - _MSK_OFFSET_HOURS, minute=minute_msk, second=0, microsecond=0)
             if day_offset == 0 and slot_dt <= now_utc:
                 continue
             if skip_slot is not None and slot_dt == skip_slot:
                 continue
             return slot_dt, category
-    raise AssertionError("unreachable — _DAILY_SLOTS должен быть непустым")
+    raise AssertionError("unreachable — _WEEKLY_SLOTS должен быть непустым и покрывать хотя бы один день в неделе")
 
 
 def _load_last_triggered_slot() -> datetime | None:
@@ -176,7 +233,49 @@ _awaiting_feedback: bool = False
 # чтобы реролл («🔄 Новый пост») пересоздавал черновик С ТОЙ ЖЕ темой слота,
 # а не случайным форматом.
 _pending_slot_category: str | None = None
+# Какой канал получит текущий черновик — основной (config.channel_id) или
+# команда-канал (config.team_channel_id, см. /postnow team|/preview team|
+# /draft team). По умолчанию основной; сбрасывается обратно к нему при
+# approve/discard, чтобы следующий обычный /postnow не унаследовал случайно
+# канал команды от предыдущего черновика.
+_pending_channel_id: str = config.channel_id
 _PENDING_DRAFT_RECHECK_SECONDS = 5 * 60
+
+# /compose: посты, для которых нет источника фактов ни в очереди, ни в
+# AI_CHANGELOG.md, ни в Docs/*.md (история выбора иконки, кто есть кто в
+# команде) — бот собирает факты вопросами в личке ДО генерации черновика,
+# вместо того чтобы придумывать/обобщать несуществующий контекст (см.
+# content_generator.generate_clarifying_questions/generate_compose_post).
+# "icon" → основной канал (config.channel_id), "team" → команда-канал
+# (config.team_channel_id) — те же два целевых канала, что уже поддержаны
+# для /postnow|/preview|/draft team, просто с другим способом получить
+# исходные факты для черновика.
+_COMPOSE_KIND_BY_TARGET = {"icon": "icon_story", "team": "team_roster"}
+# Максимум раундов уточняющих вопросов — без этого добросовестная модель
+# теоретически может уточнять бесконечно; после лимита черновик собирается
+# из того, что есть, а не блокирует пользователя навсегда.
+_COMPOSE_MAX_ROUNDS = 2
+
+
+@dataclass
+class _ComposeSession:
+    kind: str
+    channel_id: str
+    qa_pairs: list[tuple[str, str]] = field(default_factory=list)
+    pending_questions: list[str] = field(default_factory=list)
+    round: int = 0
+
+
+_compose_session: _ComposeSession | None = None
+# Факты последнего завершённого /compose по каждому kind — НЕ очищается
+# вместе с _compose_session. Нужно, чтобы "🔄 Новый пост" (реролл, см.
+# cb_reroll_post → _request_approval → _generate_post_for_slot) мог
+# перегенерировать черновик из ТЕХ ЖЕ собранных фактов, не переспрашивая
+# вопросы заново, — в отличие от обычных категорий реролл здесь не может
+# "просто взять следующую тему из очереди", источника фактов больше нигде
+# нет. Не персистится на диск — переживает только текущий процесс, это
+# ок (реролл сразу после /compose в той же сессии — единственный сценарий).
+_compose_qa_by_kind: dict[str, list[tuple[str, str]]] = {}
 _effective_require_approval = config.require_approval and bool(config.admin_chat_id)
 if config.require_approval and not config.admin_chat_id:
     logger.warning("CHANNEL_REQUIRE_APPROVAL=1, но CHANNEL_ADMIN_CHAT_ID не задан — черновику некуда идти, постим как обычно")
@@ -214,6 +313,26 @@ def _admin_filter(message: Message) -> bool:
 @dp.message(Command("id"))
 async def cmd_id(message: Message) -> None:
     await message.answer(f"Chat ID: <code>{message.chat.id}</code>")
+
+
+@dp.my_chat_member()
+async def handle_my_chat_member(update: ChatMemberUpdated) -> None:
+    # Раньше единственный способ узнать chat_id канала по инвайт-ссылке был
+    # разово прочитать getUpdates ДО того, как какой-нибудь бот начнёт их
+    # непрерывно вычитывать поллингом — теперь оба бота работают постоянно
+    # живьём, так что тот трюк больше не работает (апдейт вычитывается и
+    # пропадает из очереди раньше, чем его можно посмотреть вручную). Вместо
+    # разгадывания по логам ("Update id=N is not handled", без payload) —
+    # шлём детали сразу в админ-чат, как только статус бота в любом чате
+    # меняется (например, его добавили админом в новый канал).
+    chat = update.chat
+    status = update.new_chat_member.status
+    logger.info("my_chat_member: chat_id=%s title=%r type=%s status=%s", chat.id, chat.title, chat.type, status)
+    if config.admin_chat_id:
+        await bot.send_message(
+            config.admin_chat_id,
+            f"👋 Статус бота изменился: «{chat.title or chat.id}» (chat_id: <code>{chat.id}</code>, тип {chat.type}) → {status}",
+        )
 
 
 @dp.message(Command("addtopic"), F.func(_admin_filter))
@@ -373,7 +492,8 @@ async def cmd_status(message: Message) -> None:
         f"📋 Тем в очереди: {topics_count} | 📔 личных историй: {stories_count} | 🗒 замечаний: {feedback_count}\n"
         f"{override_line}"
         f"⏰ Следующий слот: {_CATEGORY_LABELS.get(next_category, next_category)} в {next_slot_msk:%H:%M} МСК{lead_note}\n"
-        f"💬 Ответы в обсуждении: {'включены' if config.discussion_chat_id else 'выключены (DISCUSSION_CHAT_ID не задан)'}"
+        f"💬 Ответы в обсуждении: {'включены' if config.discussion_chat_id else 'выключены (DISCUSSION_CHAT_ID не задан)'}\n"
+        f"👥 Команда-канал: {'настроен (/postnow team, /preview team, /draft team)' if config.team_channel_id else 'не настроен (TEAM_CHANNEL_ID не задан)'}"
     )
 
 
@@ -426,13 +546,45 @@ async def _send_generated_post(chat_id: str, post: GeneratedPost, photo: str | N
         return await bot.send_message(chat_id, post.text)
 
 
-def _generate_post_for_slot(category: str | None, *, dry_run: bool = False) -> GeneratedPost:
+_SUBSCRIBER_SNAPSHOT_PATH = "channel_bot/subscriber_snapshot.json"
+
+
+async def _fetch_subscriber_stats() -> tuple[int, int | None]:
+    """Текущее число подписчиков канала (реальный вызов Bot API) и дельта к
+    прошлому сохранённому снапшоту (None, если снапшота ещё не было). НЕ
+    сохраняет новый снапшот сам — снапшот обновляется только в момент
+    реальной публикации (см. _snapshot_if_feedback_metrics), иначе
+    сгенерированный, но отклонённый/среролленный черновик испортил бы
+    сравнение для следующего понедельника."""
+    count = await bot.get_chat_member_count(config.channel_id)
+    previous = load_subscriber_snapshot(_SUBSCRIBER_SNAPSHOT_PATH)
+    delta = count - previous["count"] if previous else None
+    return count, delta
+
+
+async def _snapshot_if_feedback_metrics(category: str | None) -> None:
+    if category != "feedback_metrics":
+        return
+    try:
+        count = await bot.get_chat_member_count(config.channel_id)
+        save_subscriber_snapshot(_SUBSCRIBER_SNAPSHOT_PATH, count, datetime.now(timezone.utc))
+    except Exception:
+        # Не мешает публикации — просто следующий понедельничный пост
+        # покажет "нет данных о приросте" вместо реальной дельты.
+        logger.exception("Failed to save subscriber snapshot after publishing feedback_metrics post")
+
+
+async def _generate_post_for_slot(category: str | None, *, dry_run: bool = False) -> GeneratedPost:
     """category=None — свободный формат (ручной /postnow и /preview без
     аргумента). category="intro" — разовый закреплённый пост "кто мы", своя
-    генерация без темы (см. generate_intro_post). Иначе — тема слота
-    расписания (см. _DAILY_SLOTS); для category="personal" с пустой
-    очередью историй тихо подменяет на category="feature", а не выдумывает
-    историю (см. generate_post_for_category)."""
+    генерация без темы (см. generate_intro_post). category="feedback_metrics"
+    — тоже особый случай (как "intro"): требует реального числа подписчиков
+    из Bot API (get_chat_member_count), поэтому не идёт через
+    generate_post_for_category (синхронный, без доступа к bot). Иначе — тема
+    слота расписания (см. _WEEKLY_SLOTS); для category="personal" с пустой
+    очередью историй и category="release_notes" без свежих записей changelog
+    тихо подменяет на category="feature", а не выдумывает контент (см.
+    generate_post_for_category)."""
     if category is None:
         return generate_next_post(
             llm,
@@ -447,6 +599,15 @@ def _generate_post_for_slot(category: str | None, *, dry_run: bool = False) -> G
         )
     if category == "intro":
         return generate_intro_post(llm, config.finassist_docs_path, beta_invite_url=config.beta_invite_url, feedback_path=_FEEDBACK_PATH)
+    if category in ("icon_story", "team_roster"):
+        # Реролл (см. cb_reroll_post) или ручной /postnow|/preview с этой
+        # категорией — регенерируем из ПОСЛЕДНИХ собранных через /compose
+        # фактов (см. _compose_qa_by_kind), а не заново расспрашиваем: в
+        # отличие от очереди/changelog, здесь взять "следующую тему" неоткуда.
+        return generate_compose_post(llm, category, _compose_qa_by_kind.get(category, []), chat_context=_load_team_chat_context())
+    if category == "feedback_metrics":
+        count, delta = await _fetch_subscriber_stats()
+        return generate_feedback_metrics_post(llm, count, delta, feedback_path=_FEEDBACK_PATH)
     post = generate_post_for_category(
         llm,
         category,
@@ -461,46 +622,72 @@ def _generate_post_for_slot(category: str | None, *, dry_run: bool = False) -> G
         history_path=_HISTORY_PATH,
     )
     if post is None:
-        logger.info("Story queue empty for 'personal' slot — falling back to 'feature' category")
-        return _generate_post_for_slot("feature", dry_run=dry_run)
+        logger.info("'%s' slot had no available content — falling back to 'feature' category", category)
+        return await _generate_post_for_slot("feature", dry_run=dry_run)
     return post
 
 
-async def _pin_if_intro(category: str | None, sent: Message) -> None:
+async def _pin_if_intro(category: str | None, sent: Message, channel_id: str) -> None:
     # R-CONVENIENCE: единственная категория, которую нужно закреплять — по
     # прямой просьбе ("это сообщение мы закрепим"). Требует прав админа с
     # can_pin_messages в канале — если их нет, публикация всё равно прошла,
     # только пин не сработал, поэтому не роняем публикацию из-за этого.
+    # channel_id — канал, в который РЕАЛЬНО ушёл пост (основной или
+    # команда-канал, см. _pending_channel_id) — раньше был захардкожен на
+    # config.channel_id, что закрепляло бы не в том канале для team-черновика.
     if category != "intro":
         return
     try:
-        await bot.pin_chat_message(config.channel_id, sent.message_id)
+        await bot.pin_chat_message(channel_id, sent.message_id)
     except Exception:
         logger.exception("Failed to pin intro post — публикация прошла, но закрепить не получилось (нет прав у бота?)")
 
 
-async def _publish_generated_post(category: str | None = None, *, fixed_post: GeneratedPost | None = None) -> None:
+async def _publish_generated_post(
+    category: str | None = None, *, fixed_post: GeneratedPost | None = None, channel_id: str | None = None
+) -> None:
+    channel_id = channel_id or config.channel_id
     post = fixed_post
     if post is None:
         sync_docs_repo(config.finassist_docs_path)
-        post = _generate_post_for_slot(category)
-    sent = await _send_generated_post(config.channel_id, post)
+        post = await _generate_post_for_slot(category)
+    sent = await _send_generated_post(channel_id, post)
     save_last_post_at(_POST_STATE_PATH, datetime.now(timezone.utc), title=_post_title(post))
     record_published_post(
         _HISTORY_PATH, category=category, summary=_post_history_summary(post), published_at=datetime.now(timezone.utc).isoformat()
     )
-    await _pin_if_intro(category, sent)
+    await _pin_if_intro(category, sent, channel_id)
+    await _snapshot_if_feedback_metrics(category)
+
+
+def _resolve_command_target(raw_args: str) -> tuple[str, str] | None:
+    """Общая разборка для /postnow, /preview, /draft: "team" первым словом →
+    команда-канал, иначе основной. team без TEAM_CHANNEL_ID в .env → None
+    (вызывающий код отвечает пользователю и не идёт дальше). Категория "team"
+    без явной темы по умолчанию — "personal" (закулисные/личные истории
+    команды, ровно то, для чего заводился этот канал), а не общий
+    произвольный формат, как для основного канала без темы."""
+    target, category_arg = _parse_target(raw_args)
+    channel_id = _target_channel_id(target)
+    category = category_arg.strip().lower() or None
+    if target == "team" and category is None:
+        category = "personal"
+    return (channel_id, category) if channel_id else None
 
 
 @dp.message(Command("postnow"), F.func(_admin_filter))
 async def cmd_postnow(message: Message, command: CommandObject) -> None:
-    category = (command.args or "").strip().lower() or None
+    resolved = _resolve_command_target(command.args or "")
+    if resolved is None:
+        await message.answer("TEAM_CHANNEL_ID не задан в .env — команда-канал ещё не настроен.")
+        return
+    channel_id, category = resolved
     if category and category not in _CATEGORY_LABELS:
-        await message.answer(f"Неизвестная тема «{category}». Форматы: /postnow [poll|feature|personal|intro]")
+        await message.answer(f"Неизвестная тема «{category}». Форматы: /postnow [team] [{_CATEGORY_ARG_HINT}]")
         return
     await message.answer("Публикую…")
     try:
-        await _publish_generated_post(category=category)
+        await _publish_generated_post(category=category, channel_id=channel_id)
     except Exception:
         logger.exception("Manual post failed")
         await message.answer("⚠️ Не получилось опубликовать — смотри логи бота.")
@@ -510,14 +697,18 @@ async def cmd_postnow(message: Message, command: CommandObject) -> None:
 
 @dp.message(Command("preview"), F.func(_admin_filter))
 async def cmd_preview(message: Message, command: CommandObject) -> None:
-    category = (command.args or "").strip().lower() or None
+    resolved = _resolve_command_target(command.args or "")
+    if resolved is None:
+        await message.answer("TEAM_CHANNEL_ID не задан в .env — команда-канал ещё не настроен.")
+        return
+    _channel_id, category = resolved
     if category and category not in _CATEGORY_LABELS:
-        await message.answer(f"Неизвестная тема «{category}». Форматы: /preview [poll|feature|personal|intro]")
+        await message.answer(f"Неизвестная тема «{category}». Форматы: /preview [team] [{_CATEGORY_ARG_HINT}]")
         return
     await message.answer("Генерирую предпросмотр (очередь/changelog не тронуты)…")
     try:
         sync_docs_repo(config.finassist_docs_path)
-        preview_post = _generate_post_for_slot(category, dry_run=True)
+        preview_post = await _generate_post_for_slot(category, dry_run=True)
     except Exception:
         logger.exception("Preview generation failed")
         await message.answer("⚠️ Не получилось сгенерировать предпросмотр.")
@@ -531,10 +722,15 @@ async def cmd_draft(message: Message, command: CommandObject) -> None:
     # запрашивает черновик через обычный флоу ревью (кнопки апрув/реролл/
     # правки) вне расписания — нужно, например, чтобы вечером спокойно
     # довести до ума разовый intro-пост, а не ждать его слота в расписании
-    # (у intro и вовсе нет слота в _DAILY_SLOTS).
-    category = (command.args or "").strip().lower() or None
+    # (у intro и вовсе нет слота в _WEEKLY_SLOTS, и у команда-канала нет
+    # слотов вообще — сознательно не автопостится).
+    resolved = _resolve_command_target(command.args or "")
+    if resolved is None:
+        await message.answer("TEAM_CHANNEL_ID не задан в .env — команда-канал ещё не настроен.")
+        return
+    channel_id, category = resolved
     if category and category not in _CATEGORY_LABELS:
-        await message.answer(f"Неизвестная тема «{category}». Форматы: /draft [poll|feature|personal|intro]")
+        await message.answer(f"Неизвестная тема «{category}». Форматы: /draft [team] [{_CATEGORY_ARG_HINT}]")
         return
     if not config.admin_chat_id:
         await message.answer("Нужно задать CHANNEL_ADMIN_CHAT_ID, чтобы черновик было куда прислать.")
@@ -544,24 +740,100 @@ async def cmd_draft(message: Message, command: CommandObject) -> None:
         return
     await message.answer("Генерирую черновик…")
     try:
-        await _request_approval(category=category)
+        await _request_approval(category=category, channel_id=channel_id)
     except Exception:
         logger.exception("Manual draft request failed")
         await message.answer("⚠️ Не получилось сгенерировать черновик — смотри логи.")
 
 
+def _format_questions_message(questions: list[str], *, first_round: bool) -> str:
+    numbered = "\n".join(f"{i}. {q}" for i, q in enumerate(questions, start=1))
+    intro = "Чтобы написать хороший пост, ответь, пожалуйста, одним сообщением на всё:" if first_round else "Уточню ещё немного:"
+    return f"{intro}\n\n{numbered}\n\n(можно одним сообщением, не обязательно по пунктам)"
+
+
+def _load_team_chat_context() -> str:
+    """team_bot — единственный, кто реально состоит в командном чате и
+    пишет в этот лог (см. shared/chat_log.py, TEAM_CHAT_ID); channel_bot сам
+    не участник того чата, поэтому читает тот же файл, чтобы иметь тот же
+    контекст для /compose. Пусто, если лога ещё нет (TEAM_CHAT_ID только
+    что включили и сообщений ещё не накопилось, или файл не создан) —
+    вызывающий код это переживает нормально (см. _format_qa_history)."""
+    return format_for_prompt(all_messages(DEFAULT_LOG_PATH))
+
+
+async def _start_compose_session(kind: str, channel_id: str) -> None:
+    global _compose_session
+    chat_context = _load_team_chat_context()
+    questions = generate_clarifying_questions(llm, kind, qa_pairs=[], chat_context=chat_context)
+    _compose_session = _ComposeSession(kind=kind, channel_id=channel_id, pending_questions=questions)
+    if questions:
+        await bot.send_message(config.admin_chat_id, _format_questions_message(questions, first_round=True))
+    else:
+        # Модель сразу решила, что вопросов не нужно (маловероятно на первом
+        # раунде без единого факта, но fail-open — не блокируем странным
+        # ответом модели) — сразу переходим к черновику с пустыми фактами.
+        await _finish_compose_session()
+
+
+async def _finish_compose_session() -> None:
+    """Черновик готов (модель сочла фактов достаточно ИЛИ исчерпан
+    _COMPOSE_MAX_ROUNDS) — генерируем пост и пускаем через ОБЫЧНЫЙ флоу
+    ревью/правок/публикации (_request_approval), а не отдельный путь, чтобы
+    не дублировать approve/reroll/discard/photo-attach логику."""
+    global _compose_session
+    session = _compose_session
+    _compose_session = None
+    _compose_qa_by_kind[session.kind] = session.qa_pairs
+    await bot.send_message(config.admin_chat_id, "Собрал достаточно — готовлю черновик…")
+    try:
+        post = generate_compose_post(llm, session.kind, session.qa_pairs, chat_context=_load_team_chat_context())
+        await _request_approval(category=session.kind, fixed_post=post, channel_id=session.channel_id)
+    except Exception:
+        logger.exception("Failed to generate compose draft")
+        await bot.send_message(config.admin_chat_id, "⚠️ Не получилось собрать черновик — смотри логи бота.")
+
+
+@dp.message(Command("compose"), F.func(_admin_filter))
+async def cmd_compose(message: Message, command: CommandObject) -> None:
+    target = (command.args or "").strip().lower()
+    kind = _COMPOSE_KIND_BY_TARGET.get(target)
+    if kind is None:
+        await message.answer("Формат: /compose icon (пост про выбор иконки) или /compose team (кто мы, команда-канал)")
+        return
+    channel_id = config.team_channel_id if target == "team" else config.channel_id
+    if not channel_id:
+        await message.answer("TEAM_CHANNEL_ID не задан в .env — команда-канал ещё не настроен.")
+        return
+    if not config.admin_chat_id:
+        await message.answer("Нужно задать CHANNEL_ADMIN_CHAT_ID, чтобы было куда слать вопросы и черновик.")
+        return
+    if _pending_draft is not None:
+        await message.answer("Уже есть черновик, ждущий решения, — реши его сначала (кнопки выше).")
+        return
+    if _compose_session is not None:
+        await message.answer("Уже идёт сбор фактов для другого поста — сначала ответь на те вопросы или дождись черновика.")
+        return
+    await message.answer(f"Начинаю: {_CATEGORY_LABELS[kind]}. Секунду…")
+    try:
+        await _start_compose_session(kind, channel_id)
+    except Exception:
+        logger.exception("Failed to start compose session")
+        await message.answer("⚠️ Не получилось начать — смотри логи бота.")
+
+
 @dp.message(Command("overridepost"), F.func(_admin_filter))
 async def cmd_overridepost(message: Message, command: CommandObject) -> None:
     # R-CONVENIENCE: разово подменить конкретный слот расписания (например,
-    # интро-пост вместо обычного опроса в конкретный день) — не трогая
-    # _DAILY_SLOTS насовсем. Время — момент самого ПОСТА (не апрува), лид-тайм
+    # интро-пост вместо обычного поста в конкретный день) — не трогая
+    # _WEEKLY_SLOTS насовсем. Время — момент самого ПОСТА (не апрува), лид-тайм
     # (_APPROVAL_LEAD_MINUTES) вычитается автоматически, как и для обычного
     # грид-расписания — админу не нужно считать его вручную.
     parts = (command.args or "").split()
     if len(parts) != 3:
         await message.answer(
-            "Формат: /overridepost 2026-07-18 10:00 intro\n"
-            "Дата и время — МСК, время самого поста (не апрува). Темы: poll|feature|personal|intro\n"
+            f"Формат: /overridepost 2026-07-18 10:00 intro\n"
+            f"Дата и время — МСК, время самого поста (не апрува). Темы: {_CATEGORY_ARG_HINT}\n"
             "Ответь этой командой на сообщение с готовым текстом поста — тогда захардкодит именно этот "
             "текст (без генерации LLM), category нужен только для пометки в апруве."
         )
@@ -572,7 +844,7 @@ async def cmd_overridepost(message: Message, command: CommandObject) -> None:
         fixed_text = (message.reply_to_message.text or message.reply_to_message.caption or "").strip() or None
     category = category.lower()
     if category not in _CATEGORY_LABELS:
-        await message.answer(f"Неизвестная тема «{category}». Форматы: poll|feature|personal|intro")
+        await message.answer(f"Неизвестная тема «{category}». Форматы: {_CATEGORY_ARG_HINT}")
         return
     try:
         post_at_msk = datetime.strptime(f"{date_str} {time_str}", "%Y-%m-%d %H:%M")
@@ -615,21 +887,25 @@ def _reject_followup_keyboard() -> InlineKeyboardMarkup:
     )
 
 
-async def _request_approval(category: str | None = None, *, fixed_post: GeneratedPost | None = None) -> None:
-    global _pending_draft, _pending_photo, _awaiting_feedback, _pending_slot_category
+async def _request_approval(
+    category: str | None = None, *, fixed_post: GeneratedPost | None = None, channel_id: str | None = None
+) -> None:
+    global _pending_draft, _pending_photo, _awaiting_feedback, _pending_slot_category, _pending_channel_id
     post = fixed_post
     if post is None:
         sync_docs_repo(config.finassist_docs_path)
-        post = _generate_post_for_slot(category)
+        post = await _generate_post_for_slot(category)
     _pending_draft = post
     _pending_photo = None
     _awaiting_feedback = False
     _pending_slot_category = category
+    _pending_channel_id = channel_id or config.channel_id
     category_hint = f" ({_CATEGORY_LABELS[category]})" if category else ""
+    target_hint = " · команда-канал" if _pending_channel_id == config.team_channel_id else ""
     photo_hint = "\n\n📎 Пришли мне фото, если хочешь прикрепить его к посту." if post.kind == "text" else ""
     await bot.send_message(
         config.admin_chat_id,
-        f"👀 <b>Черновик поста{category_hint} — нужно решение:</b>\n\n{_post_preview_text(post)}{photo_hint}",
+        f"👀 <b>Черновик поста{category_hint}{target_hint} — нужно решение:</b>\n\n{_post_preview_text(post)}{photo_hint}",
         reply_markup=_approval_keyboard(),
     )
 
@@ -654,7 +930,7 @@ async def handle_admin_photo(message: Message) -> None:
 
 @dp.callback_query(F.data == "approve_post")
 async def cb_approve_post(callback: CallbackQuery) -> None:
-    global _pending_draft, _pending_photo, _pending_slot_category
+    global _pending_draft, _pending_photo, _pending_slot_category, _pending_channel_id
     if not _is_admin_callback(callback):
         await callback.answer("Только из админ-чата")
         return
@@ -664,16 +940,19 @@ async def cb_approve_post(callback: CallbackQuery) -> None:
     post = _pending_draft
     photo = _pending_photo
     category = _pending_slot_category
+    channel_id = _pending_channel_id
     _pending_draft = None
     _pending_photo = None
     _pending_slot_category = None
+    _pending_channel_id = config.channel_id
     try:
-        sent = await _send_generated_post(config.channel_id, post, photo=photo)
+        sent = await _send_generated_post(channel_id, post, photo=photo)
         save_last_post_at(_POST_STATE_PATH, datetime.now(timezone.utc), title=_post_title(post))
         record_published_post(
             _HISTORY_PATH, category=category, summary=_post_history_summary(post), published_at=datetime.now(timezone.utc).isoformat()
         )
-        await _pin_if_intro(category, sent)
+        await _pin_if_intro(category, sent, channel_id)
+        await _snapshot_if_feedback_metrics(category)
     except Exception:
         logger.exception("Failed to publish approved draft")
         await callback.answer("⚠️ Не получилось опубликовать — смотри логи.", show_alert=True)
@@ -710,10 +989,12 @@ async def cb_reroll_post(callback: CallbackQuery) -> None:
     if not _is_admin_callback(callback):
         await callback.answer("Только из админ-чата")
         return
-    # Реролл сохраняет тему СЛОТА (см. _pending_slot_category) — если это был
-    # вечерний "personal"-слот, новый вариант тоже должен быть личной
-    # историей (или fallback на фичу), а не случайным форматом.
+    # Реролл сохраняет тему СЛОТА (см. _pending_slot_category) и ЦЕЛЕВОЙ
+    # канал (см. _pending_channel_id) — если это был team-черновик, новый
+    # вариант тоже должен уйти на апрув для команда-канала, а не молча
+    # откатиться на основной.
     category = _pending_slot_category
+    channel_id = _pending_channel_id
     _pending_draft = None
     _pending_photo = None
     _awaiting_feedback = False
@@ -721,7 +1002,7 @@ async def cb_reroll_post(callback: CallbackQuery) -> None:
         await callback.message.edit_text("🔄 Черновик пропущен — готовлю другой вариант…")
     await callback.answer("Готовлю новый вариант")
     try:
-        await _request_approval(category=category)
+        await _request_approval(category=category, channel_id=channel_id)
     except Exception:
         logger.exception("Failed to generate replacement draft after reroll")
         await bot.send_message(
@@ -738,7 +1019,7 @@ async def cb_discard_post(callback: CallbackQuery) -> None:
     # post_scheduled_content), включая разовые оверрайды типа интро-поста —
     # поймано вживую (см. память проекта), когда черновик из ручного /draft
     # завис бы и не пустил апрув интро-поста на следующее утро.
-    global _pending_draft, _pending_photo, _awaiting_feedback, _pending_slot_category
+    global _pending_draft, _pending_photo, _awaiting_feedback, _pending_slot_category, _pending_channel_id
     if not _is_admin_callback(callback):
         await callback.answer("Только из админ-чата")
         return
@@ -746,6 +1027,7 @@ async def cb_discard_post(callback: CallbackQuery) -> None:
     _pending_photo = None
     _awaiting_feedback = False
     _pending_slot_category = None
+    _pending_channel_id = config.channel_id
     if callback.message:
         await callback.message.edit_text("🚫 Черновик отклонён, без замены. Следующий — по расписанию.")
     await callback.answer("Ок, не публикуем")
@@ -776,7 +1058,37 @@ async def cb_suggest_edit(callback: CallbackQuery) -> None:
 
 @dp.message(F.text, F.func(_is_admin_chat))
 async def handle_admin_feedback(message: Message) -> None:
-    global _pending_draft, _awaiting_feedback
+    global _pending_draft, _awaiting_feedback, _compose_session
+    # Сбор фактов для /compose проверяем ПЕРВЫМ — это тот же "единственный
+    # обработчик произвольного текста в админ-чате, разруливает по
+    # состоянию внутри тела", что и режим правки ниже, оба состояния взаимно
+    # исключают друг друга (см. проверку "уже есть черновик"/"уже идёт сбор
+    # фактов" в cmd_compose и cmd_draft/postnow/preview).
+    if _compose_session is not None:
+        answer = (message.text or "").strip()
+        if not answer:
+            return
+        session = _compose_session
+        questions_text = "\n".join(session.pending_questions)
+        session.qa_pairs.append((questions_text, answer))
+        session.round += 1
+        if session.round >= _COMPOSE_MAX_ROUNDS:
+            await _finish_compose_session()
+            return
+        await bot.send_chat_action(message.chat.id, "typing")
+        try:
+            more_questions = generate_clarifying_questions(
+                llm, session.kind, session.qa_pairs, chat_context=_load_team_chat_context()
+            )
+        except Exception:
+            logger.exception("Failed to get follow-up compose questions — proceeding to draft with what we have")
+            more_questions = []
+        if not more_questions:
+            await _finish_compose_session()
+            return
+        session.pending_questions = more_questions
+        await message.answer(_format_questions_message(more_questions, first_round=False))
+        return
     if not _awaiting_feedback or _pending_draft is None:
         # Не режим правки — это не наш хендлер, молча пропускаем (в
         # админ-чате нет другого обработчика произвольного текста).
@@ -932,10 +1244,11 @@ _ADMIN_COMMANDS = _DEFAULT_COMMANDS + [
     BotCommand(command="feedback", description="Замечание по стилю — учту в следующих постах"),
     BotCommand(command="feedbacklist", description="Список замечаний"),
     BotCommand(command="removefeedback", description="Удалить замечание"),
-    BotCommand(command="draft", description="Запросить черновик на ревью (можно: poll/feature/personal/intro)"),
+    BotCommand(command="draft", description="Черновик на ревью [team] [poll/feature/personal/feedback_metrics/release_notes/intro]"),
+    BotCommand(command="compose", description="Собрать факты вопросами и написать пост: icon (иконка) или team (кто мы)"),
     BotCommand(command="overridepost", description="Разово подменить пост в расписании (дата время тема)"),
-    BotCommand(command="preview", description="Предпросмотр (можно: poll/feature/personal/intro)"),
-    BotCommand(command="postnow", description="Опубликовать сейчас (можно: poll/feature/personal/intro)"),
+    BotCommand(command="preview", description="Предпросмотр [team] [poll/feature/personal/feedback_metrics/release_notes/intro]"),
+    BotCommand(command="postnow", description="Опубликовать сейчас [team] [poll/feature/personal/feedback_metrics/release_notes/intro]"),
     BotCommand(command="pause", description="Приостановить автопостинг"),
     BotCommand(command="resume", description="Возобновить автопостинг"),
     BotCommand(command="status", description="Статус бота"),
