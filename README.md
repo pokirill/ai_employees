@@ -244,6 +244,10 @@ python -m channel_bot.main   # в другом
 python -m uvicorn webapp.server:app --port 8080   # в третьем — доска задач
 ```
 
+Постоянный деплой на реальный сервер (systemd, HTTPS для `/board`,
+осторожности с первым запуском `channel_bot`) — см.
+[`DEPLOYMENT.md`](DEPLOYMENT.md).
+
 ## Секреты
 Ключи (Telegram-токены, OpenAI-ключ, Apple ID app-specific password) —
 только в `.env` (не коммитится, см. `.gitignore`). Никогда не передавать их
