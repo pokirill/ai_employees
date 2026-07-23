@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 from dataclasses import dataclass, field
+from pathlib import Path
 
 from dotenv import load_dotenv
 
@@ -42,6 +43,17 @@ class TeamBotConfig:
             "FINIK_BACKEND_DOCS_PATH", "/Users/arakcheevpm/Desktop/Кубышка/Finik-backend/docs"
         )
     )
+    # Плейбук Авито (см. shared/docs_context.py) — вендорится ВНУТРИ этого
+    # репозитория (avito_playbook/docs/), а не лежит на диске отдельно, как
+    # два репо выше — поэтому дефолт вычисляется относительно расположения
+    # этого файла, а не захардкожен под конкретную машину разработки. Пусто
+    # (явно через env) → ассистент не подключает плейбук вообще.
+    avito_playbook_path: str = field(
+        default_factory=lambda: _optional(
+            "AVITO_PLAYBOOK_PATH",
+            str(Path(__file__).resolve().parent.parent / "avito_playbook" / "docs"),
+        )
+    )
 
     # R-COST: команд-бот — низкие ставки (внутренний Q&A), можно посадить на
     # более дешёвую/быструю модель, не трогая ту, что настроена для канала.
@@ -68,6 +80,8 @@ class TeamBotConfig:
         paths = [self.finassist_docs_path]
         if self.finik_backend_docs_path:
             paths.append(self.finik_backend_docs_path)
+        if self.avito_playbook_path:
+            paths.append(self.avito_playbook_path)
         return paths
 
 

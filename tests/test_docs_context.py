@@ -105,3 +105,60 @@ def test_topic_context_files_no_duplicates_across_keywords():
     # содержащий оба слова, не должен задваивать имена.
     files = topic_context_files("расскажи про goals и цели одновременно")
     assert files.count("GOALS_SCREEN.md") == 1
+
+
+def test_load_project_context_reads_avito_playbook_core_files(tmp_path):
+    # Плейбук Авито добавлен в core-набор (_CANDIDATE_CONTEXT_FILES) — грузится
+    # без extra_filenames, как и остальные core-файлы других репо.
+    (tmp_path / "development-principles.md").write_text("наши принципы разработки", encoding="utf-8")
+
+    context = load_project_context(str(tmp_path))
+
+    assert "development-principles.md" in context
+    assert "наши принципы разработки" in context
+
+
+def test_load_project_context_labels_avito_playbook_section(tmp_path):
+    repo_dir = tmp_path / "avito_playbook"
+    docs_dir = repo_dir / "docs"
+    docs_dir.mkdir(parents=True)
+    (docs_dir / "avito-developer-practice.md").write_text("практики разработки", encoding="utf-8")
+
+    context = load_project_context(str(docs_dir))
+
+    assert "[avito_playbook] avito-developer-practice.md" in context
+
+
+def test_topic_context_files_matches_avito_playbook_keywords():
+    assert "techlead-profile.md" in topic_context_files("что должен уметь тимлид?")
+    assert "QA-profile.md" in topic_context_files("какие грейды у QA?")
+    assert "design-levels.md" in topic_context_files("расскажи про дизайн грейды")
+
+
+def test_topic_context_files_analytics_keyword_covers_both_domains():
+    # "аналитик" неоднозначен между продуктовой аналитикой (FinAssist) и
+    # профилем аналитика из плейбука Авито — вопрос должен подтягивать оба.
+    files = topic_context_files("как растут аналитики в грейдах?")
+    assert "ANALYTICS_SPEC.md" in files
+    assert "analytics-levels.md" in files
+    assert "analytics-management.md" in files
+
+
+def test_load_project_context_three_repos_all_sections_survive_budget(tmp_path):
+    # Регрессия на добавление третьего корня контекста (плейбук Авито) —
+    # проверяет, что пропорциональный трим (см. 2026-07-13 фикс) всё ещё не
+    # роняет секции целиком, когда репозиториев стало три, а не два.
+    finassist = tmp_path / "FinAssist" / "Docs"
+    finik = tmp_path / "Finik-backend" / "docs"
+    playbook = tmp_path / "avito_playbook" / "docs"
+    for d in (finassist, finik, playbook):
+        d.mkdir(parents=True)
+    (finassist / "BACKLOG.md").write_text("ф" * 3000, encoding="utf-8")
+    (finik / "ARCHITECTURE.md").write_text("б" * 3000, encoding="utf-8")
+    (playbook / "development-principles.md").write_text("п" * 3000, encoding="utf-8")
+
+    context = load_project_context([str(finassist), str(finik), str(playbook)], max_chars=1500)
+
+    assert "[FinAssist] BACKLOG.md" in context
+    assert "[Finik-backend] ARCHITECTURE.md" in context
+    assert "[avito_playbook] development-principles.md" in context

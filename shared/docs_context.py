@@ -16,6 +16,13 @@ _CANDIDATE_CONTEXT_FILES = [
     "API_CONTRACT.md",
     "ARCHITECTURE.md",
     "ARCHITECTURE_DEEP_DIVE.md",
+    # Плейбук Авито (avito_playbook_path) — базовые файлы стандарта разработки,
+    # грузятся всегда, как и остальной core-набор выше. Существуют только под
+    # avito_playbook_path, под остальными путями просто не найдутся и будут
+    # пропущены (см. load_project_context) — не нужен отдельный код-путь.
+    "development-principles.md",
+    "avito-developer-practice.md",
+    "processes-and-standards.md",
 ]
 
 # "Тематический" контекст — подключается ТОЛЬКО когда вопрос явно об этой
@@ -34,8 +41,13 @@ _TOPIC_CONTEXT_FILES: dict[str, list[str]] = {
     "paycheck": ["PAYCHECK_FEATURE.md", "PAYCHECK_REQUIREMENTS.md", "PAYCHECK_IMPROVEMENTS_PLAN.md"],
     "бизнес-логик": ["BUSINESS_LOGIC.md"],
     "business logic": ["BUSINESS_LOGIC.md"],
-    "аналитик": ["ANALYTICS_SPEC.md"],
-    "analytics": ["ANALYTICS_SPEC.md"],
+    # "аналитик"/"analytics" неоднозначны между двумя доменами — продуктовые
+    # метрики (FinAssist) и грейды профессии аналитика (плейбук Авито). Не
+    # разводим по отдельным ключам (оба реально могут иметь в виду вопрос) —
+    # кладём файлы из обоих доменов под одним ключевым словом; existence-check
+    # в load_project_context сам отсеет то, чего нет под конкретным docs_path.
+    "аналитик": ["ANALYTICS_SPEC.md", "analytics-levels.md", "analytics-management.md"],
+    "analytics": ["ANALYTICS_SPEC.md", "analytics-levels.md", "analytics-management.md"],
     "метрик": ["ANALYTICS_SPEC.md"],
     "retention": ["RETENTION_ROADMAP.md"],
     "удержан": ["RETENTION_ROADMAP.md"],
@@ -47,6 +59,22 @@ _TOPIC_CONTEXT_FILES: dict[str, list[str]] = {
     "подушк": ["HOLD_GOALS_DEPOSITS.md"],
     "депозит": ["HOLD_GOALS_DEPOSITS.md"],
     "onboarding_qa": ["BACKEND_ONBOARDING_QA.md"],
+    # Плейбук Авито — грейды/роли/процессы, подключаются по теме вопроса, не
+    # на каждый запрос (как и остальной тематический набор выше).
+    "тимлид": ["techlead-profile.md", "tech_design_review.md"],
+    "tech lead": ["techlead-profile.md", "tech_design_review.md"],
+    "код-ревью": ["tech_design_review.md"],
+    "code review": ["tech_design_review.md"],
+    "qa": ["QA-profile.md"],
+    "тестирован": ["QA-profile.md"],
+    "дизайн": ["design-levels.md", "design-management.md"],
+    "design": ["design-levels.md", "design-management.md"],
+    "продукт": ["product-levels.md"],
+    "product": ["product-levels.md"],
+    "миссия": ["mission-and-values.md"],
+    "ценност": ["mission-and-values.md"],
+    "грейд": ["developer-profile.md"],
+    "компетенц": ["developer-profile.md"],
 }
 
 # Сколько последних строк AI_CHANGELOG.md брать — файл растёт неограниченно,
