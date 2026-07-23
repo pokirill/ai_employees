@@ -22,6 +22,7 @@ from shared.icloud_reminders import TaskNotFound as ReminderTaskNotFound
 from shared.llm_client import LLMClient
 from shared.rate_limiter import SlidingWindowLimiter
 from shared.reminder_digest import build_reminder_digest
+from shared.role_agents import RoleAgent, list_role_agents, role_agent_for_command
 from shared.sprint_digest import build_sprint_digest
 from shared.sprint_state import current_sprint_period, save_last_sprint_at
 from shared.task_store import TaskNotFound, TaskStore
@@ -164,6 +165,8 @@ async def cmd_help(message: Message) -> None:
         "В группе: упомяни меня (@бот вопрос) или ответь на моё сообщение\n"
         "В личке: пиши что угодно, отвечу как ассистент без команд\n\n"
         f"(до {config.max_questions_per_hour} вопросов ассистенту в час на чат — бережём бюджет)\n\n"
+        "<b>Роли</b> (советуют от лица роли — не выполняют работу сами, см. /roles)\n"
+        "/dev, /techlead, /qa, /design, /product &lt;вопрос&gt;\n\n"
         "<b>Утилита</b>\n"
         "/id — показать ID этого чата (нужно для настройки)"
     )
@@ -523,7 +526,7 @@ async def sprint_loop() -> None:
             logger.exception("Sprint loop iteration failed")
 
 
-def _ask_llm(history_key: _HistoryKey, question: str, *, force_context: bool = False) -> str:
+def _ask_llm(history_key: _HistoryKey, question: str, *, force_context: bool = False, role: RoleAgent | None = None) -> str:
     if not llm.config.api_key:
         # OPENAI_API_KEY не обязателен для старта бота (задачи/доска не
         # используют LLM), но без него ассистент отвечать не может — явная
@@ -531,12 +534,20 @@ def _ask_llm(history_key: _HistoryKey, question: str, *, force_context: bool = F
         raise RuntimeError("Ассистент ещё не настроен: не задан OPENAI_API_KEY.")
     # R-COST: контекст грузим, только если он реально нужен — иначе на
     # "привет"/"спасибо" улетал бы тот же объём токенов, что на серьёзный
-    # архитектурный вопрос. /ask — явное намерение спросить, форсируем контекст.
-    if force_context or question_needs_project_context(question):
+    # архитектурный вопрос. /ask и ролевые команды (/dev, /techlead, ...) —
+    # явное намерение спросить по делу, форсируем контекст в обоих случаях.
+    if role is not None or force_context or question_needs_project_context(question):
         sync_docs_repos(config.docs_paths)
-        extra_files = topic_context_files(question)
+        # Файлы роли (playbook_files) — ВСЕГДА в контексте ролевого вопроса,
+        # это то, что делает ответ консультацией именно от этой роли, а не
+        # просто другим вступительным текстом поверх обычного ассистента.
+        extra_files = list(role.playbook_files) if role else []
+        for filename in topic_context_files(question):
+            if filename not in extra_files:
+                extra_files.append(filename)
         context = load_project_context(config.docs_paths, max_chars=_CONTEXT_MAX_CHARS, extra_filenames=extra_files)
-        system_content = f"{_SYSTEM_PROMPT}\n\nКонтекст проекта:\n{context}"
+        persona = f"\n\n{role.persona_prompt}" if role else ""
+        system_content = f"{_SYSTEM_PROMPT}{persona}\n\nКонтекст проекта:\n{context}"
     else:
         system_content = _SYSTEM_PROMPT
 
@@ -588,6 +599,46 @@ async def cmd_ask(message: Message, command: CommandObject) -> None:
         await message.answer(f"⚠️ {_assistant_error_message(exc)}")
         return
     await message.answer(answer or "Не получилось сформулировать ответ.")
+
+
+@dp.message(Command("roles"))
+async def cmd_roles(message: Message) -> None:
+    lines = [f"/{role.command} — {role.display_name}" for role in list_role_agents()]
+    await message.answer(
+        "Ролевые консультации (советуют от лица роли, опираясь на плейбук "
+        "Авито + доки проекта — сами код не пишут и тесты не гоняют):\n"
+        + "\n".join(lines)
+        + "\n\nФормат: /dev стоит ли кэшировать этот запрос?"
+    )
+
+
+def _make_role_handler(role: RoleAgent):
+    # Замыкание должно захватывать role ПО ЗНАЧЕНИЮ на момент вызова
+    # _make_role_handler, а не по ссылке на переменную цикла регистрации —
+    # иначе все 5 команд отвечали бы от лица последней роли из ROLE_AGENTS.
+    async def handler(message: Message, command: CommandObject) -> None:
+        question = (command.args or "").strip()
+        if not question:
+            await message.answer(f"Формат: /{role.command} <вопрос>")
+            return
+        if _reject_if_rate_limited(message):
+            wait_min = round(_rate_limiter.seconds_until_available(message.chat.id) / 60)
+            await message.answer(f"⏳ Лимит вопросов на этот час исчерпан. Попробуй через ~{wait_min} мин.")
+            return
+        await bot.send_chat_action(message.chat.id, "typing")
+        try:
+            answer = _ask_llm(_history_key(message), question, role=role)
+        except Exception as exc:
+            await message.answer(f"⚠️ {_assistant_error_message(exc)}")
+            return
+        await message.answer(answer or "Не получилось сформулировать ответ.")
+
+    return handler
+
+
+for _role in list_role_agents():
+    dp.message(Command(_role.command))(_make_role_handler(_role))
+del _role
 
 
 def _strip_mention(text: str) -> str:
