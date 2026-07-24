@@ -3,6 +3,8 @@ from __future__ import annotations
 import asyncio
 import logging
 import re
+import shutil
+import tempfile
 from collections import defaultdict, deque
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -11,7 +13,7 @@ from aiogram import Bot, Dispatcher, F
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
 from aiogram.filters import Command, CommandObject
-from aiogram.types import BotCommand, InlineKeyboardButton, InlineKeyboardMarkup, Message, WebAppInfo
+from aiogram.types import BotCommand, FSInputFile, InlineKeyboardButton, InlineKeyboardMarkup, Message, WebAppInfo
 
 from shared.chat_log import DEFAULT_LOG_PATH, append_chat_message, format_for_prompt, messages_since
 from shared.config import LLMConfig, TaskBoardConfig, TeamBotConfig
@@ -26,6 +28,7 @@ from shared.role_agents import RoleAgent, list_role_agents, role_agent_for_comma
 from shared.sprint_digest import build_sprint_digest
 from shared.sprint_state import current_sprint_period, save_last_sprint_at
 from shared.task_store import TaskNotFound, TaskStore
+from shared.transcription_client import TranscriptionClient
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("team_bot")
@@ -69,8 +72,28 @@ _CONTEXT_MAX_CHARS = 12_000
 # полноценный ответ (проверено реальным вызовом API).
 _ANSWER_MAX_TOKENS = 500
 
+# Транскрибация встреч (см. handle_meeting_recording ниже) — своя, отдельная
+# от _ANSWER_MAX_TOKENS константа: резюме встречи по своей природе длиннее
+# ответа на разовый вопрос ассистенту.
+_MEETING_SUMMARY_MAX_TOKENS = 800
+_MEETING_TRANSCRIPT_MAX_CHARS = 40_000
+_MEETING_SUMMARY_PROMPT = (
+    "Ты помогаешь команде разобрать транскрипт встречи (реплики размечены таймкодом и "
+    "спикером). Сделай краткое резюме на русском: главные темы, принятые решения, задачи "
+    "с ответственными — если из реплик понятно, кто что предложил или взял на себя. Пиши "
+    "по делу, без вступлений и воды."
+)
+# Стандартный (облачный) Telegram Bot API не отдаёт боту файлы больше этого —
+# для больших записей встреч нужен свой Local Bot API Server, не входит в
+# текущий охват задачи.
+_TELEGRAM_BOT_API_DOWNLOAD_LIMIT_MB = 20
+
 bot = Bot(token=config.telegram_token, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
 dp = Dispatcher()
+# NEXARA_API_KEY не обязателен для старта бота — как и OPENAI_API_KEY у
+# ассистента, отсутствие ключа просто отключает эту конкретную возможность
+# вместо падения при импорте модуля.
+transcription_client = TranscriptionClient(config.nexara_api_key) if config.nexara_api_key else None
 
 
 @dp.message.middleware()
@@ -674,6 +697,104 @@ def _should_respond_as_assistant(message: Message) -> bool:
     # или упомянули его по имени. Отвечать на каждую реплику в общем чате
     # было бы шумно (та же логика, что и в channel_bot для чата обсуждения).
     return _is_reply_to_bot(message) or _mentions_bot(message)
+
+
+def _meeting_recording_file(message: Message) -> tuple[str, int | None] | None:
+    """file_id + file_size для голосового/аудио/видео/видео-кружка, а для
+    обычного файла (document) — только если это явно аудио/видео (иначе
+    хендлер перехватывал бы вообще любую пересланную картинку/pdf)."""
+    if message.voice:
+        return message.voice.file_id, message.voice.file_size
+    if message.audio:
+        return message.audio.file_id, message.audio.file_size
+    if message.video:
+        return message.video.file_id, message.video.file_size
+    if message.video_note:
+        return message.video_note.file_id, message.video_note.file_size
+    if message.document and (message.document.mime_type or "").startswith(("audio/", "video/")):
+        return message.document.file_id, message.document.file_size
+    return None
+
+
+def _is_meeting_recording(message: Message) -> bool:
+    return _meeting_recording_file(message) is not None
+
+
+async def _transcribe_recording(path: str) -> str:
+    """Nexara (диаризация по спикерам, лимит 3 ГБ), если задан NEXARA_API_KEY —
+    иначе OpenAI Whisper на уже настроенном OPENAI_API_KEY (без спикеров, но
+    без дополнительной регистрации). llm.transcribe — синхронный вызов, гоним
+    его в отдельном потоке, чтобы не морозить event loop бота на время всего
+    запроса к OpenAI."""
+    if transcription_client is not None:
+        return await transcription_client.transcribe(path)
+    return await asyncio.to_thread(llm.transcribe, path)
+
+
+@dp.message(F.func(_is_meeting_recording))
+async def handle_meeting_recording(message: Message) -> None:
+    if transcription_client is None and not llm.config.api_key:
+        await message.reply(
+            "Транскрибация записей встреч ещё не настроена — не задан ни NEXARA_API_KEY, ни OPENAI_API_KEY."
+        )
+        return
+
+    file_id, file_size = _meeting_recording_file(message)  # type: ignore[misc]
+    if file_size and file_size > _TELEGRAM_BOT_API_DOWNLOAD_LIMIT_MB * 1024 * 1024:
+        await message.reply(
+            f"Файл больше {_TELEGRAM_BOT_API_DOWNLOAD_LIMIT_MB} МБ — обычный Telegram Bot API "
+            "не даёт его скачать. Пришли запись как аудио, а не видео (звук легче), либо разбей на части."
+        )
+        return
+
+    status = await message.reply("🎙 Транскрибирую запись, это может занять пару минут...")
+    tmp_dir = tempfile.mkdtemp(prefix="meeting_")
+    try:
+        recording_path = str(Path(tmp_dir) / "recording")
+        try:
+            await bot.download(file_id, destination=recording_path, timeout=300)
+        except Exception:
+            logger.exception("Failed to download meeting recording")
+            await status.edit_text("Не получилось скачать файл — Telegram мог отказать из-за размера.")
+            return
+
+        await bot.send_chat_action(message.chat.id, "typing")
+        try:
+            transcript = await _transcribe_recording(recording_path)
+        except Exception:
+            logger.exception("Meeting transcription failed")
+            await status.edit_text("Не получилось транскрибировать — сервис транскрибации ответил ошибкой.")
+            return
+
+        if not transcript.strip():
+            await status.edit_text("Транскрибация вернула пустой текст — похоже, в записи нет речи.")
+            return
+
+        await status.edit_text("✍️ Готовлю резюме...")
+        try:
+            summary = llm.chat(
+                [
+                    {"role": "system", "content": _MEETING_SUMMARY_PROMPT},
+                    {"role": "user", "content": transcript[:_MEETING_TRANSCRIPT_MAX_CHARS]},
+                ],
+                max_tokens=_MEETING_SUMMARY_MAX_TOKENS,
+            )
+        except Exception:
+            logger.exception("Meeting summary LLM call failed")
+            summary = ""
+
+        transcript_path = Path(tmp_dir) / "transcript.txt"
+        transcript_path.write_text(transcript, encoding="utf-8")
+
+        await status.delete()
+        if summary:
+            await message.reply(f"📋 Резюме встречи:\n\n{summary}")
+        await message.reply_document(
+            FSInputFile(transcript_path, filename="transcript.txt"),
+            caption="Полный транскрипт встречи (по спикерам, с таймкодами)",
+        )
+    finally:
+        shutil.rmtree(tmp_dir, ignore_errors=True)
 
 
 @dp.message(F.func(_should_respond_as_assistant))

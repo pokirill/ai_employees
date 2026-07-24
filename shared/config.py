@@ -74,6 +74,12 @@ class TeamBotConfig:
     # sprint_loop) — только структурные данные доски, поэтому по просьбе не
     # тратит бюджет OpenAI вообще.
     sprint_hour: int = field(default_factory=lambda: int(_optional("TEAM_SPRINT_HOUR", "19")))
+    # Транскрибация записей встреч (см. shared/transcription_client.py,
+    # team_bot/main.py handle_meeting_recording) — сервис Nexara (api.nexara.ru),
+    # не OpenAI: поддерживает диаризацию (task=diarize, кто что сказал) и файлы
+    # до 3 ГБ вместо лимита OpenAI в 25 МБ. Пусто → хендлер честно говорит, что
+    # транскрибация не настроена, вместо падения при первой пересланной записи.
+    nexara_api_key: str = field(default_factory=lambda: _optional("NEXARA_API_KEY"))
 
     @property
     def docs_paths(self) -> list[str]:

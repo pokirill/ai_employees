@@ -57,6 +57,19 @@ class LLMClient:
                 answer = self._request(messages, max_tokens=retry_budget, temperature=temperature, model=model)
         return answer
 
+    def transcribe(self, file_path: str, *, language: str = "ru") -> str:
+        """Транскрибация аудио/видео через Whisper (whisper-1). Принимает mp3,
+        mp4, mpeg, mpga, m4a, wav, webm, ogg напрямую — Whisper сам вытаскивает
+        звуковую дорожку из видео-контейнеров, отдельная распаковка через
+        ffmpeg не нужна. Лимит OpenAI — 25 МБ на файл (см. team_bot/main.py —
+        там же проверка лимита Telegram Bot API на скачивание, 20 МБ, который
+        обычно оказывается уже этого)."""
+        with open(file_path, "rb") as audio_file:
+            transcript = self.client.audio.transcriptions.create(
+                model="whisper-1", file=audio_file, language=language
+            )
+        return transcript.text
+
     def _request(self, messages: list[dict[str, str]], *, max_tokens: int, temperature: float, model: str) -> str:
         kwargs: dict = {"model": model, "messages": messages}
         if _is_reasoning_model(model):
