@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import re
 import shutil
@@ -28,7 +29,7 @@ from shared.role_agents import RoleAgent, list_role_agents, role_agent_for_comma
 from shared.sprint_digest import build_sprint_digest
 from shared.sprint_state import current_sprint_period, save_last_sprint_at
 from shared.task_store import TaskNotFound, TaskStore
-from shared.transcription_client import TranscriptionClient
+from shared.transcription_client import MeetingTranscript, TranscriptionClient
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("team_bot")
@@ -73,15 +74,27 @@ _CONTEXT_MAX_CHARS = 12_000
 _ANSWER_MAX_TOKENS = 500
 
 # Транскрибация встреч (см. handle_meeting_recording ниже) — своя, отдельная
-# от _ANSWER_MAX_TOKENS константа: резюме встречи по своей природе длиннее
-# ответа на разовый вопрос ассистенту.
-_MEETING_SUMMARY_MAX_TOKENS = 800
+# от _ANSWER_MAX_TOKENS константа: структурированное резюме встречи (JSON,
+# см. _MEETING_SUMMARY_PROMPT) занимает больше, чем ответ на разовый вопрос.
+_MEETING_SUMMARY_MAX_TOKENS = 1200
 _MEETING_TRANSCRIPT_MAX_CHARS = 40_000
+# Просим строго JSON (не markdown/текст) — это даёт: (1) разделы резюме,
+# которые реально можно отрисовать по отдельности (темы/решения/задачи/
+# открытые вопросы), а не угадывать их в сплошном тексте; (2) action_items как
+# структуру, которую можно сразу завести на доску задач (см.
+# handle_meeting_recording — tasks_store.add_task), а не просто напечатать.
 _MEETING_SUMMARY_PROMPT = (
     "Ты помогаешь команде разобрать транскрипт встречи (реплики размечены таймкодом и "
-    "спикером). Сделай краткое резюме на русском: главные темы, принятые решения, задачи "
-    "с ответственными — если из реплик понятно, кто что предложил или взял на себя. Пиши "
-    "по делу, без вступлений и воды."
+    "спикером — если диаризации не было, весь текст одним потоком без спикеров). Ответь "
+    "СТРОГО валидным JSON без markdown-разметки, code fences и пояснений вокруг, по схеме:\n"
+    '{"tldr": "1-2 предложения о сути встречи", '
+    '"topics": ["тема 1", "тема 2"], '
+    '"decisions": ["принятое решение 1"], '
+    '"action_items": [{"assignee": "имя, ТОЛЬКО если оно явно прозвучало в разговоре, иначе null", '
+    '"task": "что именно сделать"}], '
+    '"open_questions": ["упомянули, но не решили"]}\n'
+    "Не выдумывай имена ответственных — если из реплик не ясно, кто именно, assignee: null. "
+    "Если по разделу нечего сказать — пустой список, не выдумывай содержание."
 )
 # Стандартный (облачный) Telegram Bot API не отдаёт боту файлы больше этого —
 # для больших записей встреч нужен свой Local Bot API Server, не входит в
@@ -720,7 +733,7 @@ def _is_meeting_recording(message: Message) -> bool:
     return _meeting_recording_file(message) is not None
 
 
-async def _transcribe_recording(path: str) -> str:
+async def _transcribe_recording(path: str) -> MeetingTranscript:
     """Nexara (диаризация по спикерам, лимит 3 ГБ), если задан NEXARA_API_KEY —
     иначе OpenAI Whisper на уже настроенном OPENAI_API_KEY (без спикеров, но
     без дополнительной регистрации). llm.transcribe — синхронный вызов, гоним
@@ -728,7 +741,86 @@ async def _transcribe_recording(path: str) -> str:
     запроса к OpenAI."""
     if transcription_client is not None:
         return await transcription_client.transcribe(path)
-    return await asyncio.to_thread(llm.transcribe, path)
+    text = await asyncio.to_thread(llm.transcribe, path)
+    return MeetingTranscript(text=text)
+
+
+def _parse_meeting_summary(raw: str) -> dict | None:
+    """LLM просят строгий JSON, но модели периодически всё равно оборачивают
+    ответ в ```json ... ``` — снимаем такую обёртку защитно перед парсингом,
+    вместо того чтобы считать это поломанным ответом."""
+    text = raw.strip()
+    if text.startswith("```"):
+        text = text.strip("`")
+        if text.lower().startswith("json"):
+            text = text[4:]
+        text = text.strip()
+    try:
+        data = json.loads(text)
+    except (json.JSONDecodeError, ValueError):
+        return None
+    return data if isinstance(data, dict) else None
+
+
+def _meeting_action_item_title(item: dict) -> str | None:
+    task = str(item.get("task") or "").strip()
+    if not task:
+        return None
+    assignee = item.get("assignee")
+    return f"{assignee} — {task}" if assignee else task
+
+
+def _create_task_from_meeting(title: str) -> None:
+    """Тот же путь, что и ручной /task (доска — источник правды, Напоминания —
+    best-effort зеркало) — см. cmd_task выше. created_by="встреча" — чтобы на
+    доске было видно, что задача пришла из автоматического резюме, а не
+    вручную от конкретного человека."""
+    task = tasks_store.add_task(title, created_by="встреча")
+    try:
+        uid = reminders.add_task(title, notes=f"Из резюме встречи, доска #{task.id}")
+        tasks_store.set_reminder_uid(task.id, uid)
+    except Exception:
+        logger.exception("Failed to mirror meeting task to iCloud Reminders")
+
+
+def _format_meeting_digest(data: dict, transcript: MeetingTranscript, message_date: datetime) -> tuple[str, list[str]]:
+    """Возвращает (текст резюме для Telegram, заголовки заведённых на доску
+    задач) — заголовки нужны отдельно, чтобы вызывающий код мог сам решить,
+    заводить ли их как настоящие задачи (см. handle_meeting_recording)."""
+    meta_bits = [message_date.strftime("%d.%m")]
+    if transcript.duration_seconds:
+        meta_bits.append(f"{round(transcript.duration_seconds / 60)} мин")
+    if transcript.speaker_count:
+        meta_bits.append(f"участников: {transcript.speaker_count}")
+    lines = [f"📋 <b>Резюме встречи</b> · {', '.join(meta_bits)}", ""]
+
+    tldr = str(data.get("tldr") or "").strip()
+    if tldr:
+        lines.append(tldr)
+        lines.append("")
+
+    def _bullets(title: str, items: list) -> None:
+        clean = [str(item).strip() for item in items if str(item).strip()]
+        if not clean:
+            return
+        lines.append(f"<b>{title}:</b>")
+        lines.extend(f"• {item}" for item in clean)
+        lines.append("")
+
+    _bullets("Темы", data.get("topics") or [])
+    _bullets("Решения", data.get("decisions") or [])
+
+    action_titles = []
+    for item in data.get("action_items") or []:
+        if not isinstance(item, dict):
+            continue
+        title = _meeting_action_item_title(item)
+        if title:
+            action_titles.append(title)
+    _bullets("Задачи", action_titles)
+    _bullets("Открыто (без ответа)", data.get("open_questions") or [])
+
+    return "\n".join(lines).strip(), action_titles
 
 
 @dp.message(F.func(_is_meeting_recording))
@@ -766,29 +858,44 @@ async def handle_meeting_recording(message: Message) -> None:
             await status.edit_text("Не получилось транскрибировать — сервис транскрибации ответил ошибкой.")
             return
 
-        if not transcript.strip():
+        if not transcript.text.strip():
             await status.edit_text("Транскрибация вернула пустой текст — похоже, в записи нет речи.")
             return
 
         await status.edit_text("✍️ Готовлю резюме...")
+        summary_data = None
         try:
-            summary = llm.chat(
+            raw_summary = llm.chat(
                 [
                     {"role": "system", "content": _MEETING_SUMMARY_PROMPT},
-                    {"role": "user", "content": transcript[:_MEETING_TRANSCRIPT_MAX_CHARS]},
+                    {"role": "user", "content": transcript.text[:_MEETING_TRANSCRIPT_MAX_CHARS]},
                 ],
                 max_tokens=_MEETING_SUMMARY_MAX_TOKENS,
             )
+            summary_data = _parse_meeting_summary(raw_summary) if raw_summary else None
         except Exception:
             logger.exception("Meeting summary LLM call failed")
-            summary = ""
 
         transcript_path = Path(tmp_dir) / "transcript.txt"
-        transcript_path.write_text(transcript, encoding="utf-8")
+        transcript_path.write_text(transcript.text, encoding="utf-8")
 
         await status.delete()
-        if summary:
-            await message.reply(f"📋 Резюме встречи:\n\n{summary}")
+
+        action_titles: list[str] = []
+        if summary_data is not None:
+            digest_text, action_titles = _format_meeting_digest(summary_data, transcript, message.date)
+            await message.reply(digest_text)
+        else:
+            # JSON не распарсился (или LLM вообще не ответил) — не выбрасываем
+            # работу транскрибации впустую, отдаём хотя бы файл с транскриптом.
+            logger.warning("Meeting summary was not valid JSON, skipping digest")
+            await message.reply("Не получилось разобрать резюме встречи — но вот полный транскрипт файлом.")
+
+        for title in action_titles:
+            _create_task_from_meeting(title)
+        if action_titles:
+            await message.reply(f"✅ Добавлено на доску и в напоминания: {len(action_titles)} задач(и). /board")
+
         await message.reply_document(
             FSInputFile(transcript_path, filename="transcript.txt"),
             caption="Полный транскрипт встречи (по спикерам, с таймкодами)",
