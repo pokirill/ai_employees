@@ -746,6 +746,27 @@ async def cmd_draft(message: Message, command: CommandObject) -> None:
         await message.answer("⚠️ Не получилось сгенерировать черновик — смотри логи.")
 
 
+@dp.message(Command("rawdraft"), F.func(_admin_filter))
+async def cmd_rawdraft(message: Message, command: CommandObject) -> None:
+    # R-CONVENIENCE: в отличие от /draft (текст всегда генерирует LLM), это —
+    # готовый текст, который команда сама сформулировала и хочет опубликовать
+    # буквально как есть, без переписывания. Идёт через ТОТ ЖЕ флоу апрув/
+    # фото/публикация (_request_approval с fixed_post), просто без генерации.
+    target, text = _parse_target(command.args or "")
+    text = text.strip()
+    if not text:
+        await message.answer("Формат: /rawdraft [team] <готовый текст поста целиком>")
+        return
+    channel_id = _target_channel_id(target)
+    if not channel_id:
+        await message.answer("TEAM_CHANNEL_ID не задан в .env — команда-канал ещё не настроен.")
+        return
+    if _pending_draft is not None:
+        await message.answer("Уже есть черновик, ждущий решения, — реши его сначала (кнопки выше).")
+        return
+    await _request_approval(category=None, fixed_post=GeneratedPost(kind="text", text=text), channel_id=channel_id)
+
+
 def _format_questions_message(questions: list[str], *, first_round: bool) -> str:
     numbered = "\n".join(f"{i}. {q}" for i, q in enumerate(questions, start=1))
     intro = "Чтобы написать хороший пост, ответь, пожалуйста, одним сообщением на всё:" if first_round else "Уточню ещё немного:"
@@ -1245,6 +1266,7 @@ _ADMIN_COMMANDS = _DEFAULT_COMMANDS + [
     BotCommand(command="feedbacklist", description="Список замечаний"),
     BotCommand(command="removefeedback", description="Удалить замечание"),
     BotCommand(command="draft", description="Черновик на ревью [team] [poll/feature/personal/feedback_metrics/release_notes/intro]"),
+    BotCommand(command="rawdraft", description="Черновик из готового текста [team] <текст> — без LLM, как есть"),
     BotCommand(command="compose", description="Собрать факты вопросами и написать пост: icon (иконка) или team (кто мы)"),
     BotCommand(command="overridepost", description="Разово подменить пост в расписании (дата время тема)"),
     BotCommand(command="preview", description="Предпросмотр [team] [poll/feature/personal/feedback_metrics/release_notes/intro]"),
