@@ -546,10 +546,15 @@ async def cmd_board(message: Message) -> None:
         # личном чате с ботом — в группе кнопка не сработает.
         await message.answer("Открой доску в личке со мной — напиши мне /board напрямую.")
         return
+    # Кэш-бастинг: Telegram кэширует мини-апп по URL кнопки — если открывать
+    # ВСЕГДА один и тот же board_config.webapp_url, WebView может годами
+    # показывать версию index.html, загруженную при самом первом открытии,
+    # игнорируя и Cache-Control, и реальные обновления фронтенда (см.
+    # WEBAPP-CACHE-1 в BACKLOG). Уникальный query-параметр на каждый /board —
+    # это для Telegram уже "другой" URL, поэтому WebView грузит его с нуля.
+    fresh_url = f"{board_config.webapp_url}?v={int(datetime.now(timezone.utc).timestamp())}"
     keyboard = InlineKeyboardMarkup(
-        inline_keyboard=[
-            [InlineKeyboardButton(text="📋 Открыть доску задач", web_app=WebAppInfo(url=board_config.webapp_url))]
-        ]
+        inline_keyboard=[[InlineKeyboardButton(text="📋 Открыть доску задач", web_app=WebAppInfo(url=fresh_url))]]
     )
     await message.answer("Доска задач команды:", reply_markup=keyboard)
 
