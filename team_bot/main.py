@@ -216,7 +216,7 @@ async def cmd_help(message: Message) -> None:
         "/cancel &lt;номер&gt; — отметить задачу отменённой (не «сделали»)\n"
         "/comment &lt;номер&gt; &lt;текст&gt; — комментарий к задаче\n"
         "/rename &lt;номер&gt; &lt;текст&gt; — переименовать задачу\n"
-        "/photo &lt;номер&gt; — ответь на фото этой командой, чтобы прикрепить его к задаче\n"
+        "/photo &lt;номер&gt; — пришли фото С ПОДПИСЬЮ «/photo номер» (или ответь этой командой на фото), чтобы прикрепить его к задаче\n"
         "/board — открыть доску задач (мини-апп: карточка, комментарии, статус) — в личке\n"
         "/remindnow — прислать дайджест открытых задач сейчас (обычно раз в день сам)\n"
         f"/sprintnow — превью итогов спринта за текущий период (сам — по субботам в {config.sprint_hour}:00)\n\n"
@@ -263,11 +263,13 @@ async def cmd_task(message: Message, command: CommandObject) -> None:
         logger.exception("Failed to mirror task to iCloud Reminders")
 
     photo_note = ""
-    # Заводили задачу ответом на фото (например, скриншот бага) — прикрепим
-    # само фото к задаче сразу, не только его подпись как заголовок.
-    if message.reply_to_message and message.reply_to_message.photo:
-        if await _save_task_photo(message.reply_to_message, task.id, added_by=author):
-            photo_note = "\n📷 Фото из сообщения прикреплено."
+    # Заводили задачу с фото — либо ответом на фото, либо (проще) прислав
+    # само фото с подписью "/task текст" одним сообщением — прикрепим его сразу,
+    # не только подпись как заголовок.
+    photo_source = message if message.photo else message.reply_to_message
+    if photo_source and photo_source.photo:
+        if await _save_task_photo(photo_source, task.id, added_by=author):
+            photo_note = "\n📷 Фото прикреплено."
         else:
             photo_note = "\n⚠️ Не получилось прикрепить фото — попробуй /photo позже."
     await message.answer(f"✅ Задача #{task.id} записана: «{title}»{photo_note}\nОткрыть доску: /board")
@@ -429,12 +431,19 @@ async def cmd_photo(message: Message, command: CommandObject) -> None:
     arg = (command.args or "").strip()
     if not arg.isdigit():
         await message.answer(
-            "Формат: ответь этой командой на сообщение с фото — /photo 7 "
-            "(номер задачи — из /tasks или доски)."
+            "Формат: пришли фото с подписью «/photo 7» (номер задачи — из /tasks "
+            "или доски), либо ответь этой командой на уже отправленное фото."
         )
         return
-    if not message.reply_to_message or not message.reply_to_message.photo:
-        await message.answer("Ответь командой /photo на сообщение с фото — без ответа на фото не сработает.")
+    # Проще всего — фото прямо в ЭТОМ сообщении, командой в подписи (не нужно
+    # отправлять фото отдельно и потом отвечать на него). Реплай на отдельное
+    # фото-сообщение по-прежнему работает, для обратной совместимости.
+    photo_source = message if message.photo else message.reply_to_message
+    if not photo_source or not photo_source.photo:
+        await message.answer(
+            "Не вижу фото — пришли его с подписью «/photo 7» одним сообщением, "
+            "либо ответь этой командой на сообщение с фото."
+        )
         return
     task_id = int(arg)
     try:
@@ -443,8 +452,10 @@ async def cmd_photo(message: Message, command: CommandObject) -> None:
         await message.answer("⚠️ Задача с таким номером не найдена — проверь /tasks.")
         return
     name, _ = _requester_identity(message)
-    caption = message.reply_to_message.caption or ""
-    if not await _save_task_photo(message.reply_to_message, task_id, added_by=name, caption=caption):
+    # Если фото — само это сообщение, caption это ЖЕ команда ("/photo 7"), не
+    # осмысленное описание — не сохраняем её как caption фото.
+    photo_caption = "" if photo_source is message else (photo_source.caption or "")
+    if not await _save_task_photo(photo_source, task_id, added_by=name, caption=photo_caption):
         await message.answer("⚠️ Не получилось скачать фото — попробуй ещё раз.")
         return
     await message.answer(f"📷 Фото прикреплено к задаче #{task_id}. Открыть доску: /board")
@@ -993,7 +1004,7 @@ _BOT_COMMANDS = [
     BotCommand(command="cancel", description="Отметить задачу отменённой"),
     BotCommand(command="comment", description="Комментарий к задаче"),
     BotCommand(command="rename", description="Переименовать задачу"),
-    BotCommand(command="photo", description="Прикрепить фото к задаче (ответом на фото)"),
+    BotCommand(command="photo", description="Прикрепить фото к задаче (подпись «/photo номер» на фото)"),
     BotCommand(command="board", description="Доска задач (мини-апп)"),
     BotCommand(command="remindnow", description="Дайджест открытых задач сейчас"),
     BotCommand(command="sprintnow", description="Превью итогов спринта"),
