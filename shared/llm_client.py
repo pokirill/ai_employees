@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import base64
+
 from openai import OpenAI
 
 from shared.config import LLMConfig
@@ -57,6 +59,25 @@ class LLMClient:
                 answer = self._request(messages, max_tokens=retry_budget, temperature=temperature, model=model)
         return answer
 
+    def describe_image(self, image_path: str, prompt: str, *, max_tokens: int = 400, model: str = "") -> str:
+        """Vision-запрос: картинка + текстовый промпт в одном сообщении (формат
+        content-частей OpenAI chat completions). Используется для анализа
+        фото, прикреплённых к задачам доски (см. team_bot/main.py
+        _analyze_and_annotate_photo). Reasoning-модели (gpt-5* и т.п.) уже
+        поддерживают vision наравне с обычными — тот же _request ниже."""
+        with open(image_path, "rb") as f:
+            b64 = base64.b64encode(f.read()).decode("utf-8")
+        messages = [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": prompt},
+                    {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{b64}"}},
+                ],
+            }
+        ]
+        return self._request(messages, max_tokens=max_tokens, temperature=0.4, model=model or self._model)
+
     def transcribe(self, file_path: str, *, language: str = "ru") -> str:
         """Транскрибация аудио/видео через Whisper (whisper-1). Принимает mp3,
         mp4, mpeg, mpga, m4a, wav, webm, ogg напрямую — Whisper сам вытаскивает
@@ -70,7 +91,7 @@ class LLMClient:
             )
         return transcript.text
 
-    def _request(self, messages: list[dict[str, str]], *, max_tokens: int, temperature: float, model: str) -> str:
+    def _request(self, messages: list[dict], *, max_tokens: int, temperature: float, model: str) -> str:
         kwargs: dict = {"model": model, "messages": messages}
         if _is_reasoning_model(model):
             kwargs["max_completion_tokens"] = max_tokens

@@ -61,13 +61,73 @@ async def _save_task_photo(source: Message, task_id: int, added_by: str, caption
         return False
     largest = source.photo[-1]
     file_name = f"{task_id}_{uuid.uuid4().hex}.jpg"
+    photo_path = _TASK_PHOTOS_DIR / file_name
     try:
-        await bot.download(largest.file_id, destination=str(_TASK_PHOTOS_DIR / file_name))
+        await bot.download(largest.file_id, destination=str(photo_path))
     except Exception:
         logger.exception("Failed to download task photo")
         return False
     tasks_store.add_photo(task_id, file_name, added_by=added_by, caption=caption)
+    # Анализ фото (vision + контекст из доков проекта) не должен задерживать
+    # ответ "фото прикреплено" — LLM-запросы занимают секунды, а сам факт
+    # прикрепления пользователь должен увидеть сразу. Дописывается в описание
+    # задачи в фоне, best-effort (см. _analyze_and_annotate_photo).
+    asyncio.create_task(_analyze_and_annotate_photo(task_id, str(photo_path), source.chat.id))
     return True
+
+
+async def _analyze_and_annotate_photo(task_id: int, photo_path: str, chat_id: int) -> None:
+    """Фоновый анализ прикреплённого к задаче фото: vision-описание того, что
+    на скриншоте, плюс релевантный (по теме описания) контекст из BACKLOG/
+    AI_CHANGELOG обоих репо — дописывается в description задачи, чтобы
+    карточка на доске сама объясняла суть фото и её связь с текущим
+    состоянием проекта, без ручного пересказа человеком. Best-effort: сбой
+    LLM/файла тихо логируется, не портит уже прикреплённое фото."""
+    try:
+        image_description = await asyncio.to_thread(
+            llm.describe_image,
+            photo_path,
+            "Кратко (2-3 предложения, по-русски, без markdown) опиши, что на этом "
+            "скриншоте: какой экран/фича мобильного приложения видна, есть ли "
+            "заметная проблема или баг.",
+            max_tokens=250,
+        )
+        if not image_description.strip():
+            return
+
+        extra_files = topic_context_files(image_description)
+        project_context = load_project_context(config.docs_paths, max_chars=6000, extra_filenames=extra_files)
+
+        summary = await asyncio.to_thread(
+            llm.chat,
+            [
+                {
+                    "role": "system",
+                    "content": (
+                        "Дополни описание задачи на доске команды. По анализу скриншота и "
+                        "текущему состоянию проекта (беклог/доки ниже) напиши короткое "
+                        "(3-5 предложений) дополнение: что видно на фото и как это соотносится "
+                        "с текущим кодом/беклогом, если есть связь (сослись на конкретный пункт "
+                        "беклога, если найдёшь). Если связи нет — просто перескажи, что на фото. "
+                        "По-русски, без markdown, по делу, без вступлений."
+                    ),
+                },
+                {"role": "user", "content": f"Анализ фото:\n{image_description}\n\nКонтекст проекта:\n{project_context}"},
+            ],
+            max_tokens=350,
+        )
+        if not summary.strip():
+            return
+
+        task = tasks_store.get_task(task_id)
+        addition = f"📷 Авто-анализ фото:\n{summary.strip()}"
+        new_description = f"{task.description}\n\n{addition}" if task.description else addition
+        tasks_store.set_description(task_id, new_description)
+        await bot.send_message(chat_id, f"🔍 Добавил в задачу #{task_id} контекст по фото — см. описание в /board.")
+    except TaskNotFound:
+        pass
+    except Exception:
+        logger.exception("Photo analysis failed for task #%s", task_id)
 
 # R-COST: см. shared/rate_limiter.py — не более N вопросов ассистенту в час
 # на чат, чтобы один болтливый чат не сжёг весь бюджет LLM.
