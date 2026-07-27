@@ -365,6 +365,23 @@
     color: var(--text-muted);
     margin-bottom: 6px;
   }
+  .photos-row { display: flex; gap: 8px; overflow-x: auto; padding-top: 2px; }
+  .photo-thumb {
+    flex: none;
+    display: block;
+    width: 76px;
+    height: 76px;
+    border-radius: 9px;
+    overflow: hidden;
+    border: 1px solid var(--border);
+  }
+  .photo-thumb img { width: 100%; height: 100%; object-fit: cover; display: block; }
+  .photo-count {
+    display: inline-flex;
+    align-items: center;
+    gap: 3px;
+  }
+
   textarea#card-description {
     width: 100%;
     min-height: 72px;
@@ -428,6 +445,11 @@
         <div class="card-section-label">Описание</div>
         <textarea id="card-description" placeholder="Добавь описание задачи…"></textarea>
         <button id="card-description-save" class="ghost">Сохранить описание</button>
+      </div>
+
+      <div class="card-section" id="card-photos-section" style="display:none">
+        <div class="card-section-label">Фото</div>
+        <div class="photos-row" id="card-photos"></div>
       </div>
 
       <div class="card-section">
@@ -585,6 +607,28 @@ function renderComments(container, comments) {
   });
 }
 
+function openPhoto(url) {
+  const absolute = new URL(url, location.href).toString();
+  if (tg && tg.openLink) tg.openLink(absolute); else window.open(absolute, "_blank");
+}
+
+function renderPhotos(container, photos) {
+  container.innerHTML = "";
+  (photos || []).forEach((p) => {
+    const a = document.createElement("a");
+    a.className = "photo-thumb";
+    a.href = p.url;
+    a.title = p.caption || "";
+    a.addEventListener("click", (e) => { e.preventDefault(); e.stopPropagation(); openPhoto(p.url); });
+    const img = document.createElement("img");
+    img.src = p.url;
+    img.loading = "lazy";
+    img.alt = p.caption || "Фото задачи";
+    a.appendChild(img);
+    container.appendChild(a);
+  });
+}
+
 function renderTask(task) {
   const status = task.status === "done" ? "done" : task.status === "testing" ? "testing" : "open";
 
@@ -627,6 +671,12 @@ function renderTask(task) {
     chip.className = "chip";
     chip.textContent = task.claimed_by;
     meta.appendChild(chip);
+  }
+  if (task.photos && task.photos.length) {
+    const count = document.createElement("span");
+    count.className = "photo-count";
+    count.textContent = `📷 ${task.photos.length}`;
+    meta.appendChild(count);
   }
   summary.appendChild(meta);
   body.appendChild(summary);
@@ -707,6 +757,10 @@ function renderCard(task) {
 
   const description = document.getElementById("card-description");
   if (document.activeElement !== description) description.value = task.description || "";
+
+  const photos = task.photos || [];
+  document.getElementById("card-photos-section").style.display = photos.length ? "" : "none";
+  renderPhotos(document.getElementById("card-photos"), photos);
 
   renderComments(document.getElementById("card-comments"), task.comments);
 }

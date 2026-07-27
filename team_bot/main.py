@@ -6,6 +6,7 @@ import logging
 import re
 import shutil
 import tempfile
+import uuid
 from collections import defaultdict, deque
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -45,6 +46,28 @@ reminders = ICloudReminders(
 # Доска задач (мини-апп) — источник правды для claim/статус/комментариев,
 # Напоминания остаются best-effort зеркалом (см. cmd_task/cmd_done).
 tasks_store = TaskStore(board_config.db_path)
+
+# Фото, прикреплённые к задачам (см. cmd_photo/_save_task_photo) — лежат под
+# webapp/static по умолчанию, чтобы webapp/server.py отдавал их без отдельного
+# роута (там уже смонтирован StaticFiles на /static).
+_TASK_PHOTOS_DIR = Path(board_config.photos_dir)
+_TASK_PHOTOS_DIR.mkdir(parents=True, exist_ok=True)
+
+
+async def _save_task_photo(source: Message, task_id: int, added_by: str, caption: str = "") -> bool:
+    """Качает наибольшее разрешение фото из source.photo и прикрепляет к задаче
+    task_id. Вызывающий уже проверил, что source.photo не пусто."""
+    if not source.photo:
+        return False
+    largest = source.photo[-1]
+    file_name = f"{task_id}_{uuid.uuid4().hex}.jpg"
+    try:
+        await bot.download(largest.file_id, destination=str(_TASK_PHOTOS_DIR / file_name))
+    except Exception:
+        logger.exception("Failed to download task photo")
+        return False
+    tasks_store.add_photo(task_id, file_name, added_by=added_by, caption=caption)
+    return True
 
 # R-COST: см. shared/rate_limiter.py — не более N вопросов ассистенту в час
 # на чат, чтобы один болтливый чат не сжёг весь бюджет LLM.
@@ -193,6 +216,7 @@ async def cmd_help(message: Message) -> None:
         "/cancel &lt;номер&gt; — отметить задачу отменённой (не «сделали»)\n"
         "/comment &lt;номер&gt; &lt;текст&gt; — комментарий к задаче\n"
         "/rename &lt;номер&gt; &lt;текст&gt; — переименовать задачу\n"
+        "/photo &lt;номер&gt; — ответь на фото этой командой, чтобы прикрепить его к задаче\n"
         "/board — открыть доску задач (мини-апп: карточка, комментарии, статус) — в личке\n"
         "/remindnow — прислать дайджест открытых задач сейчас (обычно раз в день сам)\n"
         f"/sprintnow — превью итогов спринта за текущий период (сам — по субботам в {config.sprint_hour}:00)\n\n"
@@ -237,7 +261,16 @@ async def cmd_task(message: Message, command: CommandObject) -> None:
         # кто смотрит список на телефоне. Сбой зеркалирования (список ещё не
         # расшарен, неверный пароль и т.п.) не должен ронять саму запись задачи.
         logger.exception("Failed to mirror task to iCloud Reminders")
-    await message.answer(f"✅ Задача #{task.id} записана: «{title}»\nОткрыть доску: /board")
+
+    photo_note = ""
+    # Заводили задачу ответом на фото (например, скриншот бага) — прикрепим
+    # само фото к задаче сразу, не только его подпись как заголовок.
+    if message.reply_to_message and message.reply_to_message.photo:
+        if await _save_task_photo(message.reply_to_message, task.id, added_by=author):
+            photo_note = "\n📷 Фото из сообщения прикреплено."
+        else:
+            photo_note = "\n⚠️ Не получилось прикрепить фото — попробуй /photo позже."
+    await message.answer(f"✅ Задача #{task.id} записана: «{title}»{photo_note}\nОткрыть доску: /board")
 
 
 @dp.message(Command("tasks"))
@@ -389,6 +422,32 @@ async def cmd_rename(message: Message, command: CommandObject) -> None:
         await message.answer("⚠️ Задача с таким номером не найдена — проверь /tasks.")
         return
     await message.answer(f"✏️ Переименовано: «{task.title}»")
+
+
+@dp.message(Command("photo"))
+async def cmd_photo(message: Message, command: CommandObject) -> None:
+    arg = (command.args or "").strip()
+    if not arg.isdigit():
+        await message.answer(
+            "Формат: ответь этой командой на сообщение с фото — /photo 7 "
+            "(номер задачи — из /tasks или доски)."
+        )
+        return
+    if not message.reply_to_message or not message.reply_to_message.photo:
+        await message.answer("Ответь командой /photo на сообщение с фото — без ответа на фото не сработает.")
+        return
+    task_id = int(arg)
+    try:
+        tasks_store.get_task(task_id)
+    except TaskNotFound:
+        await message.answer("⚠️ Задача с таким номером не найдена — проверь /tasks.")
+        return
+    name, _ = _requester_identity(message)
+    caption = message.reply_to_message.caption or ""
+    if not await _save_task_photo(message.reply_to_message, task_id, added_by=name, caption=caption):
+        await message.answer("⚠️ Не получилось скачать фото — попробуй ещё раз.")
+        return
+    await message.answer(f"📷 Фото прикреплено к задаче #{task_id}. Открыть доску: /board")
 
 
 @dp.message(Command("board"))
@@ -934,6 +993,7 @@ _BOT_COMMANDS = [
     BotCommand(command="cancel", description="Отметить задачу отменённой"),
     BotCommand(command="comment", description="Комментарий к задаче"),
     BotCommand(command="rename", description="Переименовать задачу"),
+    BotCommand(command="photo", description="Прикрепить фото к задаче (ответом на фото)"),
     BotCommand(command="board", description="Доска задач (мини-апп)"),
     BotCommand(command="remindnow", description="Дайджест открытых задач сейчас"),
     BotCommand(command="sprintnow", description="Превью итогов спринта"),

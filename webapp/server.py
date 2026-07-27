@@ -93,6 +93,15 @@ def _task_to_dict(task: Task) -> dict:
         "completed_at": task.completed_at,
         "cancelled_at": task.cancelled_at,
         "comments": [{"author": c.author, "text": c.text, "created_at": c.created_at} for c in task.comments],
+        "photos": [
+            {
+                "url": f"/static/task_photos/{p.file_name}",
+                "caption": p.caption,
+                "added_by": p.added_by,
+                "created_at": p.created_at,
+            }
+            for p in task.photos
+        ],
     }
 
 

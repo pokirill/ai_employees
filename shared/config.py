@@ -142,6 +142,10 @@ class TaskBoardConfig:
     # в неделю) и webapp (только читает её для отображения на доске), это
     # два независимо деплоящихся процесса, файл — их общая точка синхронизации.
     sprint_state_path: str = field(default_factory=lambda: _optional("SPRINT_STATE_PATH", "team_bot_last_sprint.json"))
+    # Фото, прикреплённые к задачам (team_bot/main.py cmd_photo/cmd_task) —
+    # лежат прямо под webapp/static, чтобы отдавать их без отдельного роута:
+    # webapp/server.py уже монтирует StaticFiles на /static.
+    photos_dir: str = field(default_factory=lambda: _optional("TASK_PHOTOS_DIR", "webapp/static/task_photos"))
 
 
 @dataclass(frozen=True)

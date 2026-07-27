@@ -14,6 +14,15 @@ class Comment:
 
 
 @dataclass
+class Photo:
+    id: int
+    file_name: str
+    added_by: str
+    created_at: str
+    caption: str | None = None
+
+
+@dataclass
 class Task:
     id: int
     title: str
@@ -32,6 +41,7 @@ class Task:
     claimed_by_user_id: int | None = None
     description: str | None = None
     comments: list[Comment] = field(default_factory=list)
+    photos: list[Photo] = field(default_factory=list)
     # Заполняется только при status="cancelled" — для недельного
     # спринт-дайджеста (shared/sprint_digest.py), симметрично completed_at.
     cancelled_at: str | None = None
@@ -104,6 +114,20 @@ class TaskStore:
                 )
                 """
             )
+            # Файлы самих фото лежат на диске (TaskBoardConfig.photos_dir) —
+            # тут только метаданные, как у task_comments.
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS task_photos (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    task_id INTEGER NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+                    file_name TEXT NOT NULL,
+                    caption TEXT,
+                    added_by TEXT NOT NULL,
+                    created_at TEXT NOT NULL
+                )
+                """
+            )
 
     def add_task(self, title: str, created_by: str, description: str = "") -> Task:
         with self._connect() as conn:
@@ -137,6 +161,7 @@ class TaskStore:
             tasks = [_row_to_task(row) for row in rows]
             for task in tasks:
                 task.comments = self._load_comments(conn, task.id)
+                task.photos = self._load_photos(conn, task.id)
         return tasks
 
     def list_done_since(self, since: datetime) -> list[Task]:
@@ -158,6 +183,7 @@ class TaskStore:
             tasks = [_row_to_task(row) for row in rows]
             for task in tasks:
                 task.comments = self._load_comments(conn, task.id)
+                task.photos = self._load_photos(conn, task.id)
         return tasks
 
     def get_task(self, task_id: int) -> Task:
@@ -167,6 +193,7 @@ class TaskStore:
                 raise TaskNotFound(f"Задача #{task_id} не найдена")
             task = _row_to_task(row)
             task.comments = self._load_comments(conn, task_id)
+            task.photos = self._load_photos(conn, task_id)
         return task
 
     def claim_task(self, task_id: int, claimed_by: str, claimed_by_user_id: int | None = None) -> Task:
@@ -228,6 +255,19 @@ class TaskStore:
             )
         return self.get_task(task_id)
 
+    def add_photo(self, task_id: int, file_name: str, added_by: str, caption: str = "") -> Task:
+        """file_name — имя файла на диске (TaskBoardConfig.photos_dir), не оригинальное
+        имя из Telegram: см. team_bot/main.py cmd_photo, там же качается сам файл."""
+        with self._connect() as conn:
+            exists = conn.execute("SELECT 1 FROM tasks WHERE id = ?", (task_id,)).fetchone()
+            if exists is None:
+                raise TaskNotFound(f"Задача #{task_id} не найдена")
+            conn.execute(
+                "INSERT INTO task_photos (task_id, file_name, caption, added_by, created_at) VALUES (?, ?, ?, ?, ?)",
+                (task_id, file_name, caption or None, added_by, _now()),
+            )
+        return self.get_task(task_id)
+
     def _update_or_raise(self, task_id: int, sql: str, params: tuple) -> Task:
         with self._connect() as conn:
             result = conn.execute(sql, params)
@@ -241,6 +281,23 @@ class TaskStore:
             (task_id,),
         ).fetchall()
         return [Comment(author=row["author"], text=row["text"], created_at=row["created_at"]) for row in rows]
+
+    def _load_photos(self, conn: sqlite3.Connection, task_id: int) -> list[Photo]:
+        rows = conn.execute(
+            "SELECT id, file_name, caption, added_by, created_at FROM task_photos"
+            " WHERE task_id = ? ORDER BY created_at",
+            (task_id,),
+        ).fetchall()
+        return [
+            Photo(
+                id=row["id"],
+                file_name=row["file_name"],
+                caption=row["caption"],
+                added_by=row["added_by"],
+                created_at=row["created_at"],
+            )
+            for row in rows
+        ]
 
 
 def _row_to_task(row: sqlite3.Row) -> Task:
