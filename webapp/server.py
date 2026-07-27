@@ -30,7 +30,12 @@ app.mount("/static", StaticFiles(directory=_STATIC_DIR), name="static")
 
 @app.get("/")
 def index() -> FileResponse:
-    return FileResponse(_STATIC_DIR / "index.html")
+    # Telegram открывает мини-апп в собственном WebView и без явного заголовка
+    # кэширует index.html эвристически (по Last-Modified) — после любого
+    # обновления фронтенда (например, добавления рендера фото) юзер видел
+    # старую версию страницы, пока не почистит кэш телеграма вручную.
+    # no-store заставляет WebView каждый раз перезапрашивать свежий файл.
+    return FileResponse(_STATIC_DIR / "index.html", headers={"Cache-Control": "no-store"})
 
 
 _DEFAULT_DONE_VISIBLE_DAYS = 7
