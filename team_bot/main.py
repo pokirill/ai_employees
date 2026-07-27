@@ -276,7 +276,7 @@ async def cmd_help(message: Message) -> None:
         "/cancel &lt;номер&gt; — отметить задачу отменённой (не «сделали»)\n"
         "/comment &lt;номер&gt; &lt;текст&gt; — комментарий к задаче\n"
         "/rename &lt;номер&gt; &lt;текст&gt; — переименовать задачу\n"
-        "/photo &lt;номер&gt; — пришли фото С ПОДПИСЬЮ «/photo номер» (или ответь этой командой на фото), чтобы прикрепить его к задаче\n"
+        "/photo &lt;номер&gt; — без фото в сообщении: пришлёт уже прикреплённые к задаче фото. Чтобы прикрепить новое: пришли фото с подписью «/photo номер» (или ответь этой командой на фото)\n"
         "/board — открыть доску задач (мини-апп: карточка, комментарии, статус) — в личке\n"
         "/remindnow — прислать дайджест открытых задач сейчас (обычно раз в день сам)\n"
         f"/sprintnow — превью итогов спринта за текущий период (сам — по субботам в {config.sprint_hour}:00)\n\n"
@@ -491,26 +491,38 @@ async def cmd_photo(message: Message, command: CommandObject) -> None:
     arg = (command.args or "").strip()
     if not arg.isdigit():
         await message.answer(
-            "Формат: пришли фото с подписью «/photo 7» (номер задачи — из /tasks "
-            "или доски), либо ответь этой командой на уже отправленное фото."
+            "Формат: /photo 7 — пришлёт фото, уже прикреплённые к задаче #7.\n"
+            "Чтобы ПРИКРЕПИТЬ новое: пришли фото с подписью «/photo 7» (или ответь "
+            "этой командой на сообщение с фото)."
         )
         return
+    task_id = int(arg)
+    try:
+        task = tasks_store.get_task(task_id)
+    except TaskNotFound:
+        await message.answer("⚠️ Задача с таким номером не найдена — проверь /tasks.")
+        return
+
     # Проще всего — фото прямо в ЭТОМ сообщении, командой в подписи (не нужно
     # отправлять фото отдельно и потом отвечать на него). Реплай на отдельное
     # фото-сообщение по-прежнему работает, для обратной совместимости.
     photo_source = message if message.photo else message.reply_to_message
     if not photo_source or not photo_source.photo:
-        await message.answer(
-            "Не вижу фото — пришли его с подписью «/photo 7» одним сообщением, "
-            "либо ответь этой командой на сообщение с фото."
-        )
+        # Нет фото в этом сообщении — читаем команду как запрос "покажи
+        # прикреплённые фото", а не "прикрепи новое".
+        if not task.photos:
+            await message.answer(
+                f"К задаче #{task_id} фото не прикреплено. Чтобы прикрепить — пришли "
+                f"фото с подписью «/photo {task_id}»."
+            )
+            return
+        for photo in task.photos:
+            photo_file = _TASK_PHOTOS_DIR / photo.file_name
+            if not photo_file.exists():
+                continue
+            await message.answer_photo(FSInputFile(photo_file), caption=photo.caption or None)
         return
-    task_id = int(arg)
-    try:
-        tasks_store.get_task(task_id)
-    except TaskNotFound:
-        await message.answer("⚠️ Задача с таким номером не найдена — проверь /tasks.")
-        return
+
     name, _ = _requester_identity(message)
     # Если фото — само это сообщение, caption это ЖЕ команда ("/photo 7"), не
     # осмысленное описание — не сохраняем её как caption фото.
@@ -1064,7 +1076,7 @@ _BOT_COMMANDS = [
     BotCommand(command="cancel", description="Отметить задачу отменённой"),
     BotCommand(command="comment", description="Комментарий к задаче"),
     BotCommand(command="rename", description="Переименовать задачу"),
-    BotCommand(command="photo", description="Прикрепить фото к задаче (подпись «/photo номер» на фото)"),
+    BotCommand(command="photo", description="Прикрепить фото к задаче или показать уже прикреплённые"),
     BotCommand(command="board", description="Доска задач (мини-апп)"),
     BotCommand(command="remindnow", description="Дайджест открытых задач сейчас"),
     BotCommand(command="sprintnow", description="Превью итогов спринта"),
