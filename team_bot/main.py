@@ -24,6 +24,7 @@ from shared.docs_context import load_project_context, sync_docs_repos, topic_con
 from shared.icloud_reminders import ICloudReminders
 from shared.icloud_reminders import TaskNotFound as ReminderTaskNotFound
 from shared.llm_client import LLMClient
+from shared.metrics_digest import MetricsFetchError, build_metrics_digest, fetch_metrics
 from shared.rate_limiter import SlidingWindowLimiter
 from shared.reminder_digest import build_reminder_digest
 from shared.role_agents import RoleAgent, list_role_agents, role_agent_for_command
@@ -279,7 +280,8 @@ async def cmd_help(message: Message) -> None:
         "/photo &lt;номер&gt; — без фото в сообщении: пришлёт уже прикреплённые к задаче фото. Чтобы прикрепить новое: пришли фото с подписью «/photo номер» (или ответь этой командой на фото)\n"
         "/board — открыть доску задач (мини-апп: карточка, комментарии, статус) — в личке\n"
         "/remindnow — прислать дайджест открытых задач сейчас (обычно раз в день сам)\n"
-        f"/sprintnow — превью итогов спринта за текущий период (сам — по субботам в {config.sprint_hour}:00)\n\n"
+        f"/sprintnow — превью итогов спринта за текущий период (сам — по субботам в {config.sprint_hour}:00)\n"
+        f"/metricsnow — дайджест продуктовых метрик сейчас (сам — каждый вечер в {config.metrics_hour}:00)\n\n"
         "<b>Ассистент</b>\n"
         "/ask &lt;вопрос&gt; — спросить про проект (контекст из Docs/ обоих репо + плейбук Авито)\n"
         "В группе: упомяни меня (@бот вопрос) или ответь на моё сообщение\n"
@@ -709,6 +711,46 @@ async def sprint_loop() -> None:
             logger.exception("Sprint loop iteration failed")
 
 
+async def _build_metrics_digest_or_error() -> str:
+    if not (config.admin_username and config.admin_password):
+        return "Дайджест метрик не настроен: не заданы ADMIN_USERNAME/ADMIN_PASSWORD."
+    try:
+        dashboard, persons = await fetch_metrics(config.admin_base_url, config.admin_username, config.admin_password)
+    except MetricsFetchError as exc:
+        logger.exception("Metrics fetch failed")
+        return f"Не удалось получить метрики: {exc}"
+    return build_metrics_digest(dashboard, persons)
+
+
+@dp.message(Command("metricsnow"))
+async def cmd_metrics_now(message: Message) -> None:
+    # Ручной триггер того же дайджеста, что шлёт metrics_loop раз в день —
+    # чтобы проверить формат, не дожидаясь TEAM_METRICS_HOUR.
+    await message.answer(await _build_metrics_digest_or_error())
+
+
+def _seconds_until_next_metrics() -> float:
+    now = datetime.now()
+    target = now.replace(hour=config.metrics_hour, minute=0, second=0, microsecond=0)
+    if target <= now:
+        target += timedelta(days=1)
+    return (target - now).total_seconds()
+
+
+async def metrics_loop() -> None:
+    # Раз в сутки, в config.metrics_hour ("вечером") по местному времени
+    # машины — дайджест продуктовых метрик (DAU/WAU/MAU, retention, воронка,
+    # paywall) с /admin/dashboard.json + /admin/persons.json в TEAM_CHAT_ID.
+    # Та же простая sleep-петля, что reminder_loop/sprint_loop — не критичная
+    # нотификация, персистентность пропуска при рестарте не нужна.
+    while True:
+        try:
+            await asyncio.sleep(_seconds_until_next_metrics())
+            await bot.send_message(config.team_chat_id, await _build_metrics_digest_or_error())
+        except Exception:
+            logger.exception("Metrics loop iteration failed")
+
+
 def _ask_llm(history_key: _HistoryKey, question: str, *, force_context: bool = False, role: RoleAgent | None = None) -> str:
     if not llm.config.api_key:
         # OPENAI_API_KEY не обязателен для старта бота (задачи/доска не
@@ -1085,6 +1127,7 @@ _BOT_COMMANDS = [
     BotCommand(command="board", description="Доска задач (мини-апп)"),
     BotCommand(command="remindnow", description="Дайджест открытых задач сейчас"),
     BotCommand(command="sprintnow", description="Превью итогов спринта"),
+    BotCommand(command="metricsnow", description="Дайджест продуктовых метрик сейчас"),
     BotCommand(command="ask", description="Спросить ассистента про проект"),
     BotCommand(command="id", description="ID текущего чата"),
     BotCommand(command="help", description="Список команд"),
@@ -1102,8 +1145,11 @@ async def main() -> None:
     if config.team_chat_id:
         asyncio.create_task(reminder_loop())
         asyncio.create_task(sprint_loop())
+        asyncio.create_task(metrics_loop())
     else:
-        logger.info("TEAM_CHAT_ID не задан — ежедневный дайджест и итоги спринта отключены (доступны вручную через /remindnow, /sprintnow)")
+        logger.info("TEAM_CHAT_ID не задан — ежедневный дайджест, итоги спринта и метрики отключены (доступны вручную через /remindnow, /sprintnow, /metricsnow)")
+    if not (config.admin_username and config.admin_password):
+        logger.info("ADMIN_USERNAME/ADMIN_PASSWORD не заданы — ежевечерний дайджест метрик будет отвечать честной ошибкой вместо данных")
     await dp.start_polling(bot)
 
 

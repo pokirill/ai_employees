@@ -80,6 +80,18 @@ class TeamBotConfig:
     # до 3 ГБ вместо лимита OpenAI в 25 МБ. Пусто → хендлер честно говорит, что
     # транскрибация не настроена, вместо падения при первой пересланной записи.
     nexara_api_key: str = field(default_factory=lambda: _optional("NEXARA_API_KEY"))
+    # Час (по локальному времени машины) ежевечернего дайджеста продуктовых
+    # метрик (DAU/WAU/MAU, retention, воронка онбординга, paywall) в
+    # TEAM_CHAT_ID — см. team_bot/main.py metrics_loop. Не шлётся, если
+    # team_chat_id не задан, или если ADMIN_USERNAME/ADMIN_PASSWORD не заданы
+    # (честно логирует причину вместо падения).
+    metrics_hour: int = field(default_factory=lambda: int(_optional("TEAM_METRICS_HOUR", "21")))
+    # Basic-auth в защищённую админку бэкенда (/admin/dashboard.json,
+    # /admin/persons.json) — см. shared/metrics_digest.py. Пусто → дайджест
+    # метрик отключён (не пытается запрашивать без кредов).
+    admin_base_url: str = field(default_factory=lambda: _optional("ADMIN_BASE_URL", "https://api.kubyshka.app"))
+    admin_username: str = field(default_factory=lambda: _optional("ADMIN_USERNAME"))
+    admin_password: str = field(default_factory=lambda: _optional("ADMIN_PASSWORD"))
 
     @property
     def docs_paths(self) -> list[str]:
