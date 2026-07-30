@@ -76,6 +76,12 @@ def test_only_warn_risks_are_shown():
     digest = build_metrics_digest(_dashboard(), [], today=date(2026, 7, 30))
     assert "Не все установки склеены" in digest
     assert "Всё ок" not in digest
+    assert "Стоит поднажать по этим вещам:" in digest
+
+
+def test_motivational_line_uses_real_ok_ratio():
+    digest = build_metrics_digest(_dashboard(), [], today=date(2026, 7, 30))
+    assert "Уже 50% ключевых метрик (1 из 2) в зелёной зоне" in digest
 
 
 def test_metric_status_icons():

@@ -63,7 +63,7 @@ def build_metrics_digest(dashboard: dict, persons: list[dict], *, today: date | 
     new_today = sum(1 for p in persons if (p.get("first_seen_at") or "").startswith(today_str))
     active_today = sum(1 for p in persons if p.get("active_24h"))
 
-    lines: list[str] = [f"📊 <b>Кубышка — метрики за {today.strftime('%d.%m.%Y')}</b>", ""]
+    lines: list[str] = [f"🐹 Кубыши, привет! Отчёт по метрикам за {today.strftime('%d.%m.%Y')}:", ""]
 
     lines.append(
         f"Активность: DAU {au.get('dau', '—')} · WAU {au.get('wau', '—')} · MAU {au.get('mau', '—')}"
@@ -74,6 +74,10 @@ def build_metrics_digest(dashboard: dict, persons: list[dict], *, today: date | 
     lines.append("")
 
     if metrics:
+        ok_count = sum(1 for m in metrics if m.get("status") == "ok")
+        pct = round(100 * ok_count / len(metrics))
+        lines.append(f"🎉 Вы молодцы! Уже {pct}% ключевых метрик ({ok_count} из {len(metrics)}) в зелёной зоне.")
+        lines.append("")
         lines.append("<b>Ключевые метрики:</b>")
         for entry in metrics:
             lines.append(_metric_line(entry))
@@ -100,7 +104,7 @@ def build_metrics_digest(dashboard: dict, persons: list[dict], *, today: date | 
 
     warn_risks = [r for r in product.get("launch_risks", []) if r.get("status") == "warn"]
     if warn_risks:
-        lines.append("<b>На что обратить внимание:</b>")
+        lines.append("<b>Стоит поднажать по этим вещам:</b>")
         for risk in warn_risks[:3]:
             lines.append(f"⚠️ {risk['risk']} — {risk.get('metric', '')}")
 
