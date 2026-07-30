@@ -84,6 +84,24 @@ def test_motivational_line_uses_real_ok_ratio():
     assert "Уже 50% ключевых метрик (1 из 2) в зелёной зоне" in digest
 
 
+def test_target_with_angle_bracket_is_escaped_for_telegram_html():
+    dashboard = _dashboard(
+        product={
+            "active_users": {"latest": {"dau": 19, "wau": 57, "mau": 129}},
+            "metrics": [
+                {"label": "Median TTV", "value": "7.6 мин", "target": "< 3 мин", "status": "warn"},
+            ],
+            "retention": {"checkpoints": []},
+            "paywall": {},
+            "launch_risks": [{"risk": "A & B < C", "metric": "x", "status": "warn"}],
+        }
+    )
+    digest = build_metrics_digest(dashboard, [], today=date(2026, 7, 30))
+    assert "&lt; 3 мин" in digest
+    assert "< 3 мин" not in digest
+    assert "A &amp; B &lt; C" in digest
+
+
 def test_metric_status_icons():
     digest = build_metrics_digest(_dashboard(), [], today=date(2026, 7, 30))
     assert "✅ Конверсия онбординга" in digest

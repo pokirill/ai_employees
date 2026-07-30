@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import html
 import logging
 from datetime import date
 
@@ -39,7 +40,10 @@ async def fetch_metrics(base_url: str, username: str, password: str) -> tuple[di
 
 def _metric_line(entry: dict) -> str:
     status_icon = {"ok": "✅", "warn": "⚠️", "neutral": "•"}.get(entry.get("status"), "•")
-    return f"{status_icon} {entry['label']}: {entry['value']} (цель {entry['target']})"
+    label = html.escape(str(entry["label"]))
+    value = html.escape(str(entry["value"]))
+    target = html.escape(str(entry["target"]))
+    return f"{status_icon} {label}: {value} (цель {target})"
 
 
 def build_metrics_digest(dashboard: dict, persons: list[dict], *, today: date | None = None) -> str:
@@ -83,7 +87,7 @@ def build_metrics_digest(dashboard: dict, persons: list[dict], *, today: date | 
             lines.append(_metric_line(entry))
         lines.append("")
 
-    checkpoints = {c["day"]: c["rate"] for c in retention.get("checkpoints", [])}
+    checkpoints = {c["day"]: html.escape(str(c["rate"])) for c in retention.get("checkpoints", [])}
     if checkpoints:
         wanted = ["D1", "D7", "D14", "D30"]
         parts = [f"{d} {checkpoints[d]}" for d in wanted if d in checkpoints and checkpoints[d] != "—"]
@@ -96,7 +100,7 @@ def build_metrics_digest(dashboard: dict, persons: list[dict], *, today: date | 
             "Paywall: показан {shown} раз · триал начали {trial} ({conv}) · покупок {purchases}".format(
                 shown=paywall.get("shown", 0),
                 trial=paywall.get("trial_accepted", 0),
-                conv=paywall.get("trial_conversion", "—"),
+                conv=html.escape(str(paywall.get("trial_conversion", "—"))),
                 purchases=paywall.get("purchase_completed", 0),
             )
         )
@@ -106,6 +110,8 @@ def build_metrics_digest(dashboard: dict, persons: list[dict], *, today: date | 
     if warn_risks:
         lines.append("<b>Стоит поднажать по этим вещам:</b>")
         for risk in warn_risks[:3]:
-            lines.append(f"⚠️ {risk['risk']} — {risk.get('metric', '')}")
+            risk_text = html.escape(str(risk["risk"]))
+            metric_text = html.escape(str(risk.get("metric", "")))
+            lines.append(f"⚠️ {risk_text} — {metric_text}")
 
     return "\n".join(lines).strip()
