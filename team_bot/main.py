@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import logging
 import re
@@ -196,6 +197,12 @@ dp = Dispatcher()
 transcription_client = TranscriptionClient(config.nexara_api_key) if config.nexara_api_key else None
 
 
+# username (без @, lower) -> chat_id последней личной переписки с ботом.
+# Не персистится (перезапуск бота = чистый лист) — тот же компромисс, что и
+# у _custdev_sessions/_conversation_history в этом небольшом внутреннем боте.
+_known_private_chats: dict[str, int] = {}
+
+
 @dp.message.middleware()
 async def _log_team_chat_message(handler, event, data):
     # Пассивное логирование чата команды — НОЛЬ вызовов LLM здесь, просто
@@ -214,6 +221,15 @@ async def _log_team_chat_message(handler, event, data):
     ):
         author = event.from_user.full_name if event.from_user else "неизвестно"
         append_chat_message(_CHAT_LOG_PATH, author=author, text=event.text)
+
+    # custdev (см. ниже): единственный способ проактивно написать человеку в
+    # Telegram Bot API — если он уже когда-то сам открыл личку с ботом, и мы
+    # запомнили chat_id по его username. Копим на каждом сообщении в личке,
+    # а не только на /start — часть людей (например, сам founder) уже писали
+    # боту раньше, до появления этой фичи.
+    if event.chat.type == "private" and event.from_user and event.from_user.username and not event.from_user.is_bot:
+        _known_private_chats[event.from_user.username.lower()] = event.chat.id
+
     return await handler(event, data)
 
 _SYSTEM_PROMPT = (
@@ -265,7 +281,10 @@ _bot_username: str | None = None
 
 @dp.message(Command("start"))
 @dp.message(Command("help"))
-async def cmd_help(message: Message) -> None:
+async def cmd_help(message: Message, command: CommandObject) -> None:
+    if command.command == "start" and (command.args or "").startswith("custdev_"):
+        await _start_custdev_via_deeplink(message, command.args)
+        return
     await message.answer(
         "Привет! Я помощник команды по проекту «Кубышка».\n\n"
         "<b>Задачи</b>\n"
@@ -286,8 +305,9 @@ async def cmd_help(message: Message) -> None:
         f"/sprintnow — превью итогов спринта за текущий период (сам — по субботам в {config.sprint_hour}:00)\n"
         f"/metricsnow — дайджест продуктовых метрик сейчас (сам — каждый вечер в {config.metrics_hour}:00)\n"
         f"/newsnow — дайджест новостей из фин-каналов сейчас (сам — по субботам в {config.news_digest_hour}:00)\n"
-        "/custdev &lt;username&gt; — начать customer development интервью с человеком в этом чате (только для админов)\n"
-        "/enddev — остановить активное интервью в этом чате и прислать сводку (только для админов)\n\n"
+        "/custdev &lt;username&gt; — попросить бота написать человеку в личку и провести custdev-интервью "
+        "(если он ещё не открывал бота — пришлю ссылку для пересылки, интервью начнётся само по клику; только для админов)\n"
+        "/enddev &lt;username&gt; — остановить активное интервью и прислать сводку (только для админов)\n\n"
         "<b>Ассистент</b>\n"
         "/ask &lt;вопрос&gt; — спросить про проект (контекст из Docs/ обоих репо + плейбук Авито)\n"
         "В группе: упомяни меня (@бот вопрос) или ответь на моё сообщение\n"
@@ -796,11 +816,18 @@ async def news_digest_loop() -> None:
 
 
 # ---------- CustDev interviews ----------
-# Одна активная сессия НА ЧАТ (тот же принцип простоты, что _pending_draft в
-# channel_bot) — интервью идёт там же, где его запустил админ (обычно
-# командный чат), ответы собеседника матчим по username, не по user_id
-# (голый @username в команде не даёт нам числовой ID без text_mention entity).
+# Одна активная сессия НА ЧАТ, ключ — chat_id СОБЕСЕДНИКА (не админа): бот
+# реально пишет человеку в личку, а не проводит интервью в чате админа.
+# Telegram Bot API physically не может написать первым тому, кто ни разу не
+# открывал бота (нет chat_id) — единственный обход: если chat_id уже известен
+# (_known_private_chats, см. middleware выше), пишем напрямую; если нет —
+# отдаём админу deep-link (t.me/<bot>?start=custdev_<token>), и интервью
+# стартует само, как только цель его откроет (см. _start_custdev_via_deeplink).
 _custdev_sessions: dict[int, CustDevSession] = {}
+
+# token -> (admin_username, target_username), до первого открытия deep-link'а.
+# Не персистится — тот же компромисс, что и у _custdev_sessions.
+_pending_custdev_invites: dict[str, tuple[str, str]] = {}
 
 
 def _is_custdev_admin(message: Message) -> bool:
@@ -819,34 +846,107 @@ def _is_custdev_reply(message: Message) -> bool:
     return bool(username) and username.lower() == session.target_username.lower()
 
 
+def _find_custdev_session_chat(target_username: str) -> int | None:
+    target_key = target_username.lower()
+    return next(
+        (chat_id for chat_id, session in _custdev_sessions.items() if session.target_username.lower() == target_key),
+        None,
+    )
+
+
+async def _send_custdev_invite_link(message: Message, admin_username: str, target: str) -> None:
+    token = uuid.uuid4().hex[:10]
+    _pending_custdev_invites[token] = (admin_username, target)
+    bot_username = _bot_username or "bot"
+    link = f"https://t.me/{bot_username}?start=custdev_{token}"
+    await message.answer(
+        f"@{target} ещё ни разу не открывал(а) меня — Telegram не даёт ботам "
+        f"писать первыми тем, кто их не находил. Пришли ему/ей эту ссылку "
+        f"(в любом мессенджере, куда угодно) — как только откроет, интервью "
+        f"начнётся само, и я пришлю сюда сводку по готовности:\n\n{link}"
+    )
+
+
 @dp.message(Command("custdev"), F.func(_is_custdev_admin))
 async def cmd_custdev(message: Message, command: CommandObject) -> None:
     target = (command.args or "").strip().lstrip("@")
     if not target:
         await message.answer("Формат: /custdev username (без @, юзернейм собеседника)")
         return
-    if message.chat.id in _custdev_sessions:
-        existing = _custdev_sessions[message.chat.id]
-        await message.answer(f"Уже идёт интервью с @{existing.target_username} в этом чате — заверши через /enddev.")
+    admin_username = message.from_user.username or "admin"
+
+    if _find_custdev_session_chat(target) is not None:
+        await message.answer(f"Уже идёт интервью с @{target} — дождись завершения или останови через /enddev {target}.")
         return
-    await bot.send_chat_action(message.chat.id, "typing")
-    session = await asyncio.to_thread(
-        start_interview, llm, message.chat.id, message.from_user.username or "admin", target
-    )
-    _custdev_sessions[message.chat.id] = session
+
+    known_chat_id = _known_private_chats.get(target.lower())
+    if known_chat_id is None:
+        await _send_custdev_invite_link(message, admin_username, target)
+        return
+
+    await bot.send_chat_action(known_chat_id, "typing")
+    session = await asyncio.to_thread(start_interview, llm, known_chat_id, admin_username, target)
     opening = session.history[0]["content"]
-    await message.answer(f"👋 @{target}, привет! Поможешь нам с парой вопросов про деньги/бюджет?\n\n{opening}")
+    try:
+        await bot.send_message(
+            known_chat_id,
+            f"Привет! Мы из команды «Кубышка» — поможешь нам с парой вопросов про деньги/бюджет?\n\n{opening}",
+        )
+    except Exception:
+        # Знали chat_id, но писать не вышло (заблокировал бота, снёс чат и т.п.)
+        # — единственный оставшийся путь тот же, что и для незнакомого chat_id.
+        logger.exception("custdev: proactive DM to known chat failed for @%s", target)
+        await _send_custdev_invite_link(message, admin_username, target)
+        return
+    _custdev_sessions[known_chat_id] = session
+    await message.answer(f"Написал @{target} напрямую в личку — жду ответа.")
 
 
 @dp.message(Command("enddev"), F.func(_is_custdev_admin))
-async def cmd_enddev(message: Message) -> None:
-    session = _custdev_sessions.pop(message.chat.id, None)
-    if not session:
-        await message.answer("В этом чате нет активного интервью.")
+async def cmd_enddev(message: Message, command: CommandObject) -> None:
+    target = (command.args or "").strip().lstrip("@")
+    if not target:
+        if not _custdev_sessions:
+            await message.answer("Нет активных интервью.")
+            return
+        listing = ", ".join(f"@{s.target_username}" for s in _custdev_sessions.values())
+        await message.answer(f"Формат: /enddev username. Сейчас идут интервью с: {listing}")
+        return
+    chat_id = _find_custdev_session_chat(target)
+    if chat_id is None:
+        await message.answer(f"Нет активного интервью с @{target}.")
+        return
+    session = _custdev_sessions.pop(chat_id)
+    await bot.send_chat_action(chat_id, "typing")
+    summary = await asyncio.to_thread(build_summary, llm, session)
+    with contextlib.suppress(Exception):
+        await bot.send_message(chat_id, "Спасибо, на сегодня вопросов достаточно! 🙌")
+    await message.answer(f"Интервью с @{session.target_username} остановлено вручную.\n\n{summary}")
+
+
+async def _start_custdev_via_deeplink(message: Message, payload: str) -> None:
+    token = payload[len("custdev_"):]
+    invite = _pending_custdev_invites.pop(token, None)
+    if invite is None:
+        await message.answer("Привет! Похоже, эта ссылка на интервью уже неактуальна — попроси прислать новую.")
+        return
+    admin_username, target_username = invite
+    if message.chat.id in _custdev_sessions:
+        await message.answer("У нас уже идёт интервью в этом чате — дождись завершения.")
         return
     await bot.send_chat_action(message.chat.id, "typing")
-    summary = await asyncio.to_thread(build_summary, llm, session)
-    await message.answer(f"Интервью с @{session.target_username} остановлено вручную.\n\n{summary}")
+    session = await asyncio.to_thread(start_interview, llm, message.chat.id, admin_username, target_username)
+    _custdev_sessions[message.chat.id] = session
+    opening = session.history[0]["content"]
+    await message.answer(
+        f"Привет! Мы из команды «Кубышка» — поможешь нам с парой вопросов про деньги/бюджет?\n\n{opening}"
+    )
+    if config.team_chat_id:
+        with contextlib.suppress(Exception):
+            await bot.send_message(
+                config.team_chat_id,
+                f"🎤 @{target_username} открыл(а) ссылку на интервью — начал(а) отвечать (запросил @{admin_username}).",
+            )
 
 
 @dp.message(F.func(_is_custdev_reply))
