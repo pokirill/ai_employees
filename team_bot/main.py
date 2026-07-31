@@ -16,6 +16,7 @@ from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
 from aiogram.filters import Command, CommandObject
 from aiogram.types import BotCommand, FSInputFile, InlineKeyboardButton, InlineKeyboardMarkup, Message, WebAppInfo
+from docx import Document
 
 from shared.chat_log import DEFAULT_LOG_PATH, append_chat_message, format_for_prompt, messages_since
 from shared.config import LLMConfig, TaskBoardConfig, TeamBotConfig
@@ -922,6 +923,53 @@ def _is_meeting_recording(message: Message) -> bool:
     return _meeting_recording_file(message) is not None
 
 
+# Готовый транскрипт текстом (человек сам расшифровал встречу, например в
+# другом сервисе, и прислал файл) — в отличие от _meeting_recording_file
+# (аудио/видео, которое ЕЩЁ предстоит транскрибировать нам самим).
+_MEETING_TRANSCRIPT_DOCUMENT_MIME_TYPES = {
+    "application/vnd.openxmlformats-officedocument.wordprocessingml.document",  # .docx
+    "text/plain",  # .txt
+}
+_MEETING_TRANSCRIPT_DOCUMENT_EXTENSIONS = (".docx", ".txt")
+
+
+def _meeting_transcript_document_file(message: Message) -> tuple[str, int | None, str] | None:
+    """file_id + размер + расширение для документа с готовой текстовой
+    транскрибацией (.docx/.txt). Проверяем и mime_type, и расширение имени
+    файла — некоторые клиенты Telegram шлют .docx с generic
+    application/octet-stream вместо честного mime-типа."""
+    if not message.document:
+        return None
+    filename = message.document.file_name or ""
+    mime = message.document.mime_type or ""
+    ext = Path(filename).suffix.lower()
+    if ext not in _MEETING_TRANSCRIPT_DOCUMENT_EXTENSIONS and mime not in _MEETING_TRANSCRIPT_DOCUMENT_MIME_TYPES:
+        return None
+    if not ext:
+        ext = ".docx" if "wordprocessingml" in mime else ".txt"
+    return message.document.file_id, message.document.file_size, ext
+
+
+def _is_meeting_transcript_document(message: Message) -> bool:
+    return _meeting_transcript_document_file(message) is not None
+
+
+def _extract_transcript_text(path: str, ext: str) -> str:
+    """.docx — через python-docx (текст параграфов, без таблиц/сносок — этого
+    достаточно для транскрипта встречи); .txt — сырые байты с fallback по
+    кодировке (Word/Блокнот на Windows нередко сохраняют в cp1251)."""
+    if ext == ".docx":
+        doc = Document(path)
+        return "\n".join(p.text for p in doc.paragraphs if p.text.strip())
+    data = Path(path).read_bytes()
+    for encoding in ("utf-8", "cp1251"):
+        try:
+            return data.decode(encoding)
+        except UnicodeDecodeError:
+            continue
+    return data.decode("utf-8", errors="replace")
+
+
 async def _transcribe_recording(path: str) -> MeetingTranscript:
     """Nexara (диаризация по спикерам, лимит 3 ГБ), если задан NEXARA_API_KEY —
     иначе OpenAI Whisper на уже настроенном OPENAI_API_KEY (без спикеров, но
@@ -1012,6 +1060,58 @@ def _format_meeting_digest(data: dict, transcript: MeetingTranscript, message_da
     return "\n".join(lines).strip(), action_titles
 
 
+async def _summarize_and_deliver_meeting_transcript(
+    message: Message, transcript: MeetingTranscript, tmp_dir: str, status: Message
+) -> None:
+    """Общий хвост для обоих источников транскрипта (аудио, которое мы сами
+    транскрибировали, ИЛИ уже готовый .docx/.txt) — от текста транскрипта до
+    резюме в чат, задач на доске и файла с полным текстом. Один и тот же
+    контракт делает баги в этом месте видимыми сразу для обоих путей, а не
+    только для того, который тестировали последним."""
+    if not transcript.text.strip():
+        await status.edit_text("Транскрипт пустой — нечего разбирать.")
+        return
+
+    await status.edit_text("✍️ Готовлю резюме...")
+    summary_data = None
+    try:
+        raw_summary = llm.chat(
+            [
+                {"role": "system", "content": _MEETING_SUMMARY_PROMPT},
+                {"role": "user", "content": transcript.text[:_MEETING_TRANSCRIPT_MAX_CHARS]},
+            ],
+            max_tokens=_MEETING_SUMMARY_MAX_TOKENS,
+        )
+        summary_data = _parse_meeting_summary(raw_summary) if raw_summary else None
+    except Exception:
+        logger.exception("Meeting summary LLM call failed")
+
+    transcript_path = Path(tmp_dir) / "transcript.txt"
+    transcript_path.write_text(transcript.text, encoding="utf-8")
+
+    await status.delete()
+
+    action_titles: list[str] = []
+    if summary_data is not None:
+        digest_text, action_titles = _format_meeting_digest(summary_data, transcript, message.date)
+        await message.reply(digest_text)
+    else:
+        # JSON не распарсился (или LLM вообще не ответил) — не выбрасываем
+        # работу транскрибации впустую, отдаём хотя бы файл с транскриптом.
+        logger.warning("Meeting summary was not valid JSON, skipping digest")
+        await message.reply("Не получилось разобрать резюме встречи — но вот полный транскрипт файлом.")
+
+    for title in action_titles:
+        _create_task_from_meeting(title)
+    if action_titles:
+        await message.reply(f"✅ Добавлено на доску и в напоминания: {len(action_titles)} задач(и). /board")
+
+    await message.reply_document(
+        FSInputFile(transcript_path, filename="transcript.txt"),
+        caption="Полный текст встречи",
+    )
+
+
 @dp.message(F.func(_is_meeting_recording))
 async def handle_meeting_recording(message: Message) -> None:
     if transcription_client is None and not llm.config.api_key:
@@ -1051,44 +1151,46 @@ async def handle_meeting_recording(message: Message) -> None:
             await status.edit_text("Транскрибация вернула пустой текст — похоже, в записи нет речи.")
             return
 
-        await status.edit_text("✍️ Готовлю резюме...")
-        summary_data = None
+        await _summarize_and_deliver_meeting_transcript(message, transcript, tmp_dir, status)
+    finally:
+        shutil.rmtree(tmp_dir, ignore_errors=True)
+
+
+@dp.message(F.func(_is_meeting_transcript_document))
+async def handle_meeting_transcript_document(message: Message) -> None:
+    """Пользователь сам расшифровал встречу (например, другим сервисом) и
+    прислал готовый текст файлом .docx/.txt — тот же результат (резюме,
+    задачи на доске), что и для аудио, но без шага транскрибации: текст
+    уже есть, экономим время и деньги на Nexara/Whisper."""
+    if not llm.config.api_key:
+        await message.reply("Резюме по готовому транскрипту требует настроенного LLM (OPENAI_API_KEY), а его нет.")
+        return
+
+    file_id, file_size, ext = _meeting_transcript_document_file(message)  # type: ignore[misc]
+    if file_size and file_size > _TELEGRAM_BOT_API_DOWNLOAD_LIMIT_MB * 1024 * 1024:
+        await message.reply(f"Файл больше {_TELEGRAM_BOT_API_DOWNLOAD_LIMIT_MB} МБ — Telegram Bot API не даёт его скачать.")
+        return
+
+    status = await message.reply("📄 Читаю транскрипт...")
+    tmp_dir = tempfile.mkdtemp(prefix="meeting_doc_")
+    try:
+        doc_path = str(Path(tmp_dir) / f"transcript{ext}")
         try:
-            raw_summary = llm.chat(
-                [
-                    {"role": "system", "content": _MEETING_SUMMARY_PROMPT},
-                    {"role": "user", "content": transcript.text[:_MEETING_TRANSCRIPT_MAX_CHARS]},
-                ],
-                max_tokens=_MEETING_SUMMARY_MAX_TOKENS,
-            )
-            summary_data = _parse_meeting_summary(raw_summary) if raw_summary else None
+            await bot.download(file_id, destination=doc_path, timeout=120)
         except Exception:
-            logger.exception("Meeting summary LLM call failed")
+            logger.exception("Failed to download meeting transcript document")
+            await status.edit_text("Не получилось скачать файл.")
+            return
 
-        transcript_path = Path(tmp_dir) / "transcript.txt"
-        transcript_path.write_text(transcript.text, encoding="utf-8")
+        try:
+            text = _extract_transcript_text(doc_path, ext)
+        except Exception:
+            logger.exception("Failed to extract text from meeting transcript document")
+            await status.edit_text("Не получилось прочитать файл — убедись, что это .docx или .txt с текстом транскрипта.")
+            return
 
-        await status.delete()
-
-        action_titles: list[str] = []
-        if summary_data is not None:
-            digest_text, action_titles = _format_meeting_digest(summary_data, transcript, message.date)
-            await message.reply(digest_text)
-        else:
-            # JSON не распарсился (или LLM вообще не ответил) — не выбрасываем
-            # работу транскрибации впустую, отдаём хотя бы файл с транскриптом.
-            logger.warning("Meeting summary was not valid JSON, skipping digest")
-            await message.reply("Не получилось разобрать резюме встречи — но вот полный транскрипт файлом.")
-
-        for title in action_titles:
-            _create_task_from_meeting(title)
-        if action_titles:
-            await message.reply(f"✅ Добавлено на доску и в напоминания: {len(action_titles)} задач(и). /board")
-
-        await message.reply_document(
-            FSInputFile(transcript_path, filename="transcript.txt"),
-            caption="Полный транскрипт встречи (по спикерам, с таймкодами)",
-        )
+        transcript = MeetingTranscript(text=text)
+        await _summarize_and_deliver_meeting_transcript(message, transcript, tmp_dir, status)
     finally:
         shutil.rmtree(tmp_dir, ignore_errors=True)
 
