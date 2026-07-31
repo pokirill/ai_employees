@@ -26,6 +26,8 @@ from shared.icloud_reminders import ICloudReminders
 from shared.icloud_reminders import TaskNotFound as ReminderTaskNotFound
 from shared.llm_client import LLMClient
 from shared.metrics_digest import MetricsFetchError, build_metrics_digest, fetch_metrics
+from team_bot.custdev import CustDevSession, build_summary, continue_interview, start_interview
+from team_bot.news_digest import build_news_digest
 from shared.rate_limiter import SlidingWindowLimiter
 from shared.reminder_digest import build_reminder_digest
 from shared.role_agents import RoleAgent, list_role_agents, role_agent_for_command
@@ -282,7 +284,10 @@ async def cmd_help(message: Message) -> None:
         "/board — открыть доску задач (мини-апп: карточка, комментарии, статус) — в личке\n"
         "/remindnow — прислать дайджест открытых задач сейчас (обычно раз в день сам)\n"
         f"/sprintnow — превью итогов спринта за текущий период (сам — по субботам в {config.sprint_hour}:00)\n"
-        f"/metricsnow — дайджест продуктовых метрик сейчас (сам — каждый вечер в {config.metrics_hour}:00)\n\n"
+        f"/metricsnow — дайджест продуктовых метрик сейчас (сам — каждый вечер в {config.metrics_hour}:00)\n"
+        f"/newsnow — дайджест новостей из фин-каналов сейчас (сам — по субботам в {config.news_digest_hour}:00)\n"
+        "/custdev &lt;username&gt; — начать customer development интервью с человеком в этом чате (только для админов)\n"
+        "/enddev — остановить активное интервью в этом чате и прислать сводку (только для админов)\n\n"
         "<b>Ассистент</b>\n"
         "/ask &lt;вопрос&gt; — спросить про проект (контекст из Docs/ обоих репо + плейбук Авито)\n"
         "В группе: упомяни меня (@бот вопрос) или ответь на моё сообщение\n"
@@ -750,6 +755,114 @@ async def metrics_loop() -> None:
             await bot.send_message(config.team_chat_id, await _build_metrics_digest_or_error())
         except Exception:
             logger.exception("Metrics loop iteration failed")
+
+
+@dp.message(Command("newsnow"))
+async def cmd_news_now(message: Message) -> None:
+    # Ручной триггер того же дайджеста, что шлёт news_digest_loop раз в
+    # неделю — чтобы проверить формат/список каналов, не дожидаясь субботы.
+    # Синхронный HTTP-скрейпинг + LLM-вызов с веб-поиском — небыстро (десятки
+    # секунд), предупреждаем, чтобы не выглядело зависшим.
+    await message.answer("Собираю дайджест за неделю и перепроверяю новости — это может занять минуту…")
+    digest = await asyncio.to_thread(build_news_digest, llm, config.news_digest_channels)
+    await message.answer(digest, disable_web_page_preview=True)
+
+
+def _seconds_until_next_news_digest() -> float:
+    now = datetime.now()
+    days_until_saturday = (5 - now.weekday()) % 7  # Monday=0 ... Saturday=5
+    target = (now + timedelta(days=days_until_saturday)).replace(
+        hour=config.news_digest_hour, minute=0, second=0, microsecond=0
+    )
+    if target <= now:
+        target += timedelta(days=7)
+    return (target - now).total_seconds()
+
+
+async def news_digest_loop() -> None:
+    # Раз в неделю, в субботу УТРОМ (config.news_digest_hour) по местному
+    # времени машины — дайджест инсайтов из фин-каналов (см.
+    # team_bot/news_digest.py) в TEAM_CHAT_ID. Утро, а не вечер как у
+    # sprint/metrics, — прямая просьба founder'а ("собирал инфу... в субботу
+    # утром"). Синхронная функция (httpx.Client + LLM-вызов) — уводим в поток,
+    # чтобы не блокировать event loop бота на время скрейпинга/веб-поиска.
+    while True:
+        try:
+            await asyncio.sleep(_seconds_until_next_news_digest())
+            digest = await asyncio.to_thread(build_news_digest, llm, config.news_digest_channels)
+            await bot.send_message(config.team_chat_id, digest, disable_web_page_preview=True)
+        except Exception:
+            logger.exception("News digest loop iteration failed")
+
+
+# ---------- CustDev interviews ----------
+# Одна активная сессия НА ЧАТ (тот же принцип простоты, что _pending_draft в
+# channel_bot) — интервью идёт там же, где его запустил админ (обычно
+# командный чат), ответы собеседника матчим по username, не по user_id
+# (голый @username в команде не даёт нам числовой ID без text_mention entity).
+_custdev_sessions: dict[int, CustDevSession] = {}
+
+
+def _is_custdev_admin(message: Message) -> bool:
+    username = message.from_user.username if message.from_user else None
+    if not username:
+        return False
+    allowed = {u.lower() for u in config.custdev_admin_usernames}
+    return username.lower() in allowed
+
+
+def _is_custdev_reply(message: Message) -> bool:
+    session = _custdev_sessions.get(message.chat.id)
+    if not session or not message.text or message.text.startswith("/"):
+        return False
+    username = message.from_user.username if message.from_user else None
+    return bool(username) and username.lower() == session.target_username.lower()
+
+
+@dp.message(Command("custdev"), F.func(_is_custdev_admin))
+async def cmd_custdev(message: Message, command: CommandObject) -> None:
+    target = (command.args or "").strip().lstrip("@")
+    if not target:
+        await message.answer("Формат: /custdev username (без @, юзернейм собеседника)")
+        return
+    if message.chat.id in _custdev_sessions:
+        existing = _custdev_sessions[message.chat.id]
+        await message.answer(f"Уже идёт интервью с @{existing.target_username} в этом чате — заверши через /enddev.")
+        return
+    await bot.send_chat_action(message.chat.id, "typing")
+    session = await asyncio.to_thread(
+        start_interview, llm, message.chat.id, message.from_user.username or "admin", target
+    )
+    _custdev_sessions[message.chat.id] = session
+    opening = session.history[0]["content"]
+    await message.answer(f"👋 @{target}, привет! Поможешь нам с парой вопросов про деньги/бюджет?\n\n{opening}")
+
+
+@dp.message(Command("enddev"), F.func(_is_custdev_admin))
+async def cmd_enddev(message: Message) -> None:
+    session = _custdev_sessions.pop(message.chat.id, None)
+    if not session:
+        await message.answer("В этом чате нет активного интервью.")
+        return
+    await bot.send_chat_action(message.chat.id, "typing")
+    summary = await asyncio.to_thread(build_summary, llm, session)
+    await message.answer(f"Интервью с @{session.target_username} остановлено вручную.\n\n{summary}")
+
+
+@dp.message(F.func(_is_custdev_reply))
+async def handle_custdev_reply(message: Message) -> None:
+    # ВАЖНО: зарегистрирован раньше handle_assistant_message — иначе в личке
+    # (`_should_respond_as_assistant` там всегда True) ответ собеседника ушёл
+    # бы обычному ассистенту вместо продолжения интервью.
+    session = _custdev_sessions[message.chat.id]
+    await bot.send_chat_action(message.chat.id, "typing")
+    reply, is_done = await asyncio.to_thread(continue_interview, llm, session, message.text or "")
+    await message.answer(reply)
+    if is_done:
+        del _custdev_sessions[message.chat.id]
+        summary = await asyncio.to_thread(build_summary, llm, session)
+        target_chat = config.team_chat_id or message.chat.id
+        await bot.send_message(target_chat, summary)
 
 
 def _ask_llm(history_key: _HistoryKey, question: str, *, force_context: bool = False, role: RoleAgent | None = None) -> str:
@@ -1230,6 +1343,9 @@ _BOT_COMMANDS = [
     BotCommand(command="remindnow", description="Дайджест открытых задач сейчас"),
     BotCommand(command="sprintnow", description="Превью итогов спринта"),
     BotCommand(command="metricsnow", description="Дайджест продуктовых метрик сейчас"),
+    BotCommand(command="newsnow", description="Дайджест новостей из фин-каналов сейчас"),
+    BotCommand(command="custdev", description="Начать customer development интервью (админы)"),
+    BotCommand(command="enddev", description="Остановить активное интервью (админы)"),
     BotCommand(command="ask", description="Спросить ассистента про проект"),
     BotCommand(command="id", description="ID текущего чата"),
     BotCommand(command="help", description="Список команд"),
@@ -1248,8 +1364,9 @@ async def main() -> None:
         asyncio.create_task(reminder_loop())
         asyncio.create_task(sprint_loop())
         asyncio.create_task(metrics_loop())
+        asyncio.create_task(news_digest_loop())
     else:
-        logger.info("TEAM_CHAT_ID не задан — ежедневный дайджест, итоги спринта и метрики отключены (доступны вручную через /remindnow, /sprintnow, /metricsnow)")
+        logger.info("TEAM_CHAT_ID не задан — ежедневный дайджест, итоги спринта, метрики и новостной дайджест отключены (доступны вручную через /remindnow, /sprintnow, /metricsnow, /newsnow)")
     if not (config.admin_username and config.admin_password):
         logger.info("ADMIN_USERNAME/ADMIN_PASSWORD не заданы — ежевечерний дайджест метрик будет отвечать честной ошибкой вместо данных")
     await dp.start_polling(bot)

@@ -78,6 +78,35 @@ class LLMClient:
         ]
         return self._request(messages, max_tokens=max_tokens, temperature=0.4, model=model or self._model)
 
+    def search_chat(
+        self, messages: list[dict[str, str]], *, max_tokens: int = 1200, model: str = "gpt-4o-search-preview"
+    ) -> tuple[str, list[str]]:
+        """Запрос с включённым веб-поиском (OpenAI web_search_options) —
+        единственный способ в этой кодовой базе реально ПРОВЕРИТЬ факт, а не
+        просто спросить модель по памяти (см. team_bot/news_digest.py:
+        founder явно просил перепроверять новость и показывать ссылку на
+        первоисточник — сайт, а не Telegram-канал). Возвращает (текст,
+        список URL источников из annotations) — URL достаём из ответа модели,
+        а не парсим текст руками, чтобы не гадать формат ссылки.
+        gpt-4o-search-preview не reasoning-модель (другой префикс) — обычный
+        max_tokens/без temperature (сама search-preview его не принимает).
+        """
+        completion = self.client.chat.completions.create(
+            model=model,
+            messages=messages,
+            web_search_options={},
+            max_tokens=max_tokens,
+        )
+        message = completion.choices[0].message
+        text = message.content or ""
+        urls: list[str] = []
+        for annotation in getattr(message, "annotations", None) or []:
+            citation = getattr(annotation, "url_citation", None)
+            url = getattr(citation, "url", None) if citation else None
+            if url and url not in urls:
+                urls.append(url)
+        return text, urls
+
     def transcribe(self, file_path: str, *, language: str = "ru") -> str:
         """Транскрибация аудио/видео через Whisper (whisper-1). Принимает mp3,
         mp4, mpeg, mpga, m4a, wav, webm, ogg напрямую — Whisper сам вытаскивает

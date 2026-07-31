@@ -92,6 +92,38 @@ class TeamBotConfig:
     admin_base_url: str = field(default_factory=lambda: _optional("ADMIN_BASE_URL", "https://api.kubyshka.app"))
     admin_username: str = field(default_factory=lambda: _optional("ADMIN_USERNAME"))
     admin_password: str = field(default_factory=lambda: _optional("ADMIN_PASSWORD"))
+    # Час (в субботу утром, по локальному времени машины) еженедельного
+    # дайджеста инсайтов из фин-каналов в TEAM_CHAT_ID — см.
+    # team_bot/news_digest.py + team_bot/main.py news_digest_loop. Утро (не
+    # вечер, как sprint/metrics) — просьба founder'а: "собирал инфу за неделю
+    # ... в субботу утром".
+    news_digest_hour: int = field(default_factory=lambda: int(_optional("TEAM_NEWS_DIGEST_HOUR", "9")))
+    # Публичные Telegram-каналы (без @, через запятую) — источники для
+    # еженедельного дайджеста. Формат/тематика ориентирована на
+    # @finance_pro_tg (авторский блог о финансовой грамотности) — подбирали
+    # похожие по жанру каналы (инсайты+новости от одного автора/небольшой
+    # редакции), не официальные каналы банков (другой жанр). Список можно
+    # менять в .env без правки кода.
+    news_digest_channels: tuple[str, ...] = field(
+        default_factory=lambda: tuple(
+            c.strip().lstrip("@")
+            for c in _optional(
+                "TEAM_NEWS_DIGEST_CHANNELS",
+                "finance_pro_tg,multievan,banksta,markettwits,nebrexnya",
+            ).split(",")
+            if c.strip()
+        )
+    )
+    # Username'ы (без @), которым разрешено запускать /custdev — см.
+    # team_bot/custdev.py. Founder — главный админ по умолчанию (fullbyte9),
+    # плюс остальные явно перечисленные в .env через запятую.
+    custdev_admin_usernames: tuple[str, ...] = field(
+        default_factory=lambda: tuple(
+            u.strip().lstrip("@")
+            for u in _optional("TEAM_CUSTDEV_ADMINS", "fullbyte9,varushkaushko,popov_kirill_a").split(",")
+            if u.strip()
+        )
+    )
 
     @property
     def docs_paths(self) -> list[str]:
