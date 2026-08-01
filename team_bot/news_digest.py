@@ -95,6 +95,23 @@ _DIGEST_SYSTEM_PROMPT = (
 )
 
 
+# R-RATELIMIT: боевой прогон на 5 каналов за неделю (~90 постов, полный
+# текст) давал запрос на ~26000 токенов при лимите организации в 6000 TPM
+# для gpt-4o-search-preview (429 RateLimitError) — дайджест ни разу не
+# собирался, только честный fallback "ошибка LLM/поиска". Обрезаем ОБА
+# уровня: длину каждого поста (длинные аналитические посты — не длинные
+# новостные — не должны съедать весь бюджет в одиночку) и суммарный размер
+# текста на входе, оставляя запас под system-промпт и max_tokens=1800 вывода.
+_MAX_CHARS_PER_POST = 600
+_MAX_TOTAL_INPUT_CHARS = 12_000
+
+
+def _truncate(text: str, limit: int) -> str:
+    if len(text) <= limit:
+        return text
+    return text[:limit].rstrip() + "…"
+
+
 def build_news_digest(llm: LLMClient, channels: tuple[str, ...], *, days: int = 7) -> str:
     since = datetime.now(timezone.utc) - timedelta(days=days)
     posts = collect_weekly_posts(channels, since)
@@ -106,10 +123,30 @@ def build_news_digest(llm: LLMClient, channels: tuple[str, ...], *, days: int = 
             "каналов в TEAM_NEWS_DIGEST_CHANNELS или сеть."
         )
 
-    raw_posts_text = "\n\n---\n\n".join(f"[@{p.channel}, {p.posted_at:%d.%m %H:%M}]\n{p.text}" for p in posts)
+    post_blocks = []
+    total_chars = 0
+    truncated_post_count = 0
+    for p in posts:
+        block = f"[@{p.channel}, {p.posted_at:%d.%m %H:%M}]\n{_truncate(p.text, _MAX_CHARS_PER_POST)}"
+        if total_chars + len(block) > _MAX_TOTAL_INPUT_CHARS:
+            break
+        post_blocks.append(block)
+        total_chars += len(block)
+    if len(post_blocks) < len(posts):
+        truncated_post_count = len(posts) - len(post_blocks)
+
+    raw_posts_text = "\n\n---\n\n".join(post_blocks)
+    note = (
+        f"\n\n(ещё {truncated_post_count} постов не поместилось в лимит модели — не учтены в этой сводке)"
+        if truncated_post_count
+        else ""
+    )
     messages = [
         {"role": "system", "content": _DIGEST_SYSTEM_PROMPT},
-        {"role": "user", "content": f"Посты за неделю ({len(posts)} шт. из {len(channels)} каналов):\n\n{raw_posts_text}"},
+        {
+            "role": "user",
+            "content": f"Посты за неделю ({len(post_blocks)} шт. из {len(channels)} каналов):\n\n{raw_posts_text}{note}",
+        },
     ]
     try:
         text, source_urls = llm.search_chat(messages, max_tokens=1800)
@@ -120,6 +157,12 @@ def build_news_digest(llm: LLMClient, channels: tuple[str, ...], *, days: int = 
     if not text.strip():
         return "📰 Еженедельный дайджест: после фактчека не осталось ни одной подтверждённой новости за эту неделю."
 
-    logger.info("News digest built: %d posts in, %d cited sources", len(posts), len(source_urls))
-    header = f"📰 <b>Дайджест недели</b> — экономика и финансы, {len(posts)} постов из {len(channels)} каналов, с проверкой источников:\n\n"
+    logger.info(
+        "News digest built: %d/%d posts in (rest truncated), %d cited sources",
+        len(post_blocks), len(posts), len(source_urls),
+    )
+    header = (
+        f"📰 <b>Дайджест недели</b> — экономика и финансы, {len(post_blocks)} постов из {len(channels)} каналов, "
+        "с проверкой источников:\n\n"
+    )
     return header + text

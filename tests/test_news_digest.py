@@ -108,3 +108,34 @@ def test_build_news_digest_success_includes_header_and_llm_text(monkeypatch):
     # Промпт фактчека передан модели как system-сообщение.
     assert llm.calls[0][0]["role"] == "system"
     assert "первоисточник" in llm.calls[0][0]["content"]
+
+
+# R-RATELIMIT: боевой прогон на 5 каналов/неделю (~90 постов, полный текст)
+# упирался в 429 RateLimitError у OpenAI (запрос ~26000 токенов при лимите
+# организации 6000 TPM для gpt-4o-search-preview) — дайджест НИ РАЗУ не
+# собрался, только честный fallback "ошибка LLM/поиска". Эти два теста
+# фиксируют оба уровня защиты от повторения.
+def test_build_news_digest_truncates_each_long_post(monkeypatch):
+    long_post = ChannelPost(channel="x", text="А" * 5000, posted_at=datetime.now(timezone.utc))
+    monkeypatch.setattr("team_bot.news_digest.collect_weekly_posts", lambda channels, since: [long_post])
+    llm = _FakeLLM(text="ok")
+    build_news_digest(llm, ("x",))
+    user_content = llm.calls[0][1]["content"]
+    # Пост обрезан до _MAX_CHARS_PER_POST (600), не ушёл в модель целиком (5000).
+    assert "А" * 700 not in user_content
+    assert user_content.count("А") < 700
+
+
+def test_build_news_digest_caps_total_input_size_across_many_posts(monkeypatch):
+    now = datetime.now(timezone.utc)
+    many_posts = [ChannelPost(channel="x", text="слово " * 90, posted_at=now) for _ in range(50)]
+    monkeypatch.setattr("team_bot.news_digest.collect_weekly_posts", lambda channels, since: many_posts)
+    llm = _FakeLLM(text="ok")
+    result = build_news_digest(llm, ("x",))
+    user_content = llm.calls[0][1]["content"]
+    # Суммарный размер входа ограничен независимо от того, сколько постов нашлось.
+    assert len(user_content) < 15_000
+    # Честно отмечено, что часть постов не влезла — не тихо потеряна.
+    assert "не поместилось в лимит" in user_content
+    # Итоговый счётчик в шапке отражает РЕАЛЬНО учтённые посты, не общий сырой.
+    assert "50 постов" not in result
