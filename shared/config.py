@@ -99,17 +99,21 @@ class TeamBotConfig:
     # ... в субботу утром".
     news_digest_hour: int = field(default_factory=lambda: int(_optional("TEAM_NEWS_DIGEST_HOUR", "9")))
     # Публичные Telegram-каналы (без @, через запятую) — источники для
-    # еженедельного дайджеста. Формат/тематика ориентирована на
-    # @finance_pro_tg (авторский блог о финансовой грамотности) — подбирали
-    # похожие по жанру каналы (инсайты+новости от одного автора/небольшой
-    # редакции), не официальные каналы банков (другой жанр). Список можно
-    # менять в .env без правки кода.
+    # еженедельного дайджеста. Намеренно РАЗНОГО формата (не 10 клонов одного
+    # жанра): @finance_pro_tg/@nastya_docs — авторские блоги про личные
+    # финансы; @finmeme — мемный/ироничный (в духе Aviasales) взгляд на рынок;
+    # @bankiruofficial — новости банковских продуктов/ставок; @russianmacro,
+    # @cbonds — макро/долговой рынок для контекста. Каждый явно проверен на
+    # отсутствие политики/войны в постах (2026) — при добавлении новых
+    # каналов эту проверку повторять обязательно, жанр дайджеста строго
+    # неполитический. Список можно менять в .env без правки кода.
     news_digest_channels: tuple[str, ...] = field(
         default_factory=lambda: tuple(
             c.strip().lstrip("@")
             for c in _optional(
                 "TEAM_NEWS_DIGEST_CHANNELS",
-                "finance_pro_tg,multievan,banksta,markettwits,nebrexnya",
+                "finance_pro_tg,multievan,banksta,markettwits,nebrexnya,"
+                "finmeme,bankiruofficial,nastya_docs,russianmacro,cbonds",
             ).split(",")
             if c.strip()
         )
