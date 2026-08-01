@@ -132,9 +132,16 @@ _DIGEST_SYSTEM_PROMPT = (
 # собирался, только честный fallback "ошибка LLM/поиска". Обрезаем ОБА
 # уровня: длину каждого поста (длинные аналитические посты — не длинные
 # новостные — не должны съедать весь бюджет в одиночку) и суммарный размер
-# текста на входе, оставляя запас под system-промпт и max_tokens=1800 вывода.
-_MAX_CHARS_PER_POST = 600
-_MAX_TOTAL_INPUT_CHARS = 12_000
+# текста на входе, оставляя запас под system-промпт и вывод.
+#
+# Первая версия капов (12000 символов, ÷4 символа/токен) всё ещё падала в
+# 429 (6278 против лимита 6000) после того как вырос system-промпт и список
+# каналов расширился до 10 — расчёт ÷4 симв/токен был для английского,
+# кириллица токенизируется хуже (реально ближе к ÷2.5). Дальше считаем от
+# этого более пессимистичного соотношения с явным запасом, а не впритык.
+_MAX_CHARS_PER_POST = 350
+_MAX_TOTAL_INPUT_CHARS = 5_000
+_DIGEST_MAX_OUTPUT_TOKENS = 1400
 
 
 def _truncate(text: str, limit: int) -> str:
@@ -180,7 +187,7 @@ def build_news_digest(llm: LLMClient, channels: tuple[str, ...], *, days: int = 
         },
     ]
     try:
-        text, source_urls = llm.search_chat(messages, max_tokens=1800)
+        text, source_urls = llm.search_chat(messages, max_tokens=_DIGEST_MAX_OUTPUT_TOKENS)
     except Exception:
         logger.exception("News digest LLM call failed")
         return "📰 Еженедельный дайджест: не получилось собрать сводку — ошибка LLM/поиска, смотри логи бота."
