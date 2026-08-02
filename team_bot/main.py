@@ -10,6 +10,7 @@ import tempfile
 import uuid
 from collections import defaultdict, deque
 from datetime import datetime, timedelta, timezone
+from zoneinfo import ZoneInfo
 from pathlib import Path
 
 from aiogram import Bot, Dispatcher, F
@@ -39,6 +40,15 @@ from shared.transcription_client import MeetingTranscript, TranscriptionClient
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("team_bot")
+
+# TEAM_REMINDER_HOUR/TEAM_SPRINT_HOUR/TEAM_METRICS_HOUR/TEAM_NEWS_DIGEST_HOUR —
+# часы в московском времени (10:00/19:00/21:00/09:00). Сервер живёт в UTC, а
+# старый код планировал через наивный datetime.now() = время машины = UTC, не
+# Москва. Из-за этого метрики стреляли в 21:00 UTC = 00:00 МСК — в первую
+# секунду нового московского дня, поэтому "DAU за сегодня" в дайджесте был 0,
+# хотя уже через несколько часов в админке за тот же день показывалось честное
+# значение. Считаем время явно по Москве, а не полагаемся на локаль машины.
+_MOSCOW_TZ = ZoneInfo("Europe/Moscow")
 
 config = TeamBotConfig()
 board_config = TaskBoardConfig()
@@ -596,7 +606,7 @@ async def cmd_remind_now(message: Message) -> None:
 
 
 def _seconds_until_next_reminder() -> float:
-    now = datetime.now()
+    now = datetime.now(_MOSCOW_TZ)
     target = now.replace(hour=config.reminder_hour, minute=0, second=0, microsecond=0)
     if target <= now:
         target += timedelta(days=1)
@@ -604,7 +614,7 @@ def _seconds_until_next_reminder() -> float:
 
 
 async def reminder_loop() -> None:
-    # Раз в сутки, в config.reminder_hour по местному времени машины —
+    # Раз в сутки, в config.reminder_hour по московскому времени —
     # дайджест открытых задач в TEAM_CHAT_ID. Не персистится и не защищено от
     # пропуска при рестарте бота ровно в момент отправки — это ежедневное
     # напоминание, не критичная нотификация, простой sleep-цикл достаточен.
@@ -712,7 +722,7 @@ async def cmd_sprint_now(message: Message) -> None:
 
 
 def _seconds_until_next_sprint_boundary() -> float:
-    now = datetime.now()
+    now = datetime.now(_MOSCOW_TZ)
     days_until_saturday = (5 - now.weekday()) % 7  # Monday=0 ... Saturday=5
     target = (now + timedelta(days=days_until_saturday)).replace(hour=config.sprint_hour, minute=0, second=0, microsecond=0)
     if target <= now:
@@ -721,7 +731,7 @@ def _seconds_until_next_sprint_boundary() -> float:
 
 
 async def sprint_loop() -> None:
-    # Раз в неделю, в субботу в config.sprint_hour по местному времени машины
+    # Раз в неделю, в субботу в config.sprint_hour по московскому времени
     # — итоги спринта в TEAM_CHAT_ID. Граница периода продвигается ВСЕГДА
     # (даже если сводка пустой период и не отправляется) — иначе пустая
     # неделя задвоила бы период со следующей.
@@ -756,7 +766,7 @@ async def cmd_metrics_now(message: Message) -> None:
 
 
 def _seconds_until_next_metrics() -> float:
-    now = datetime.now()
+    now = datetime.now(_MOSCOW_TZ)
     target = now.replace(hour=config.metrics_hour, minute=0, second=0, microsecond=0)
     if target <= now:
         target += timedelta(days=1)
@@ -789,7 +799,7 @@ async def cmd_news_now(message: Message) -> None:
 
 
 def _seconds_until_next_news_digest() -> float:
-    now = datetime.now()
+    now = datetime.now(_MOSCOW_TZ)
     days_until_saturday = (5 - now.weekday()) % 7  # Monday=0 ... Saturday=5
     target = (now + timedelta(days=days_until_saturday)).replace(
         hour=config.news_digest_hour, minute=0, second=0, microsecond=0
