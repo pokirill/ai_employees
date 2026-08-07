@@ -80,12 +80,17 @@ class TeamBotConfig:
     # до 3 ГБ вместо лимита OpenAI в 25 МБ. Пусто → хендлер честно говорит, что
     # транскрибация не настроена, вместо падения при первой пересланной записи.
     nexara_api_key: str = field(default_factory=lambda: _optional("NEXARA_API_KEY"))
-    # Час (по локальному времени машины) ежевечернего дайджеста продуктовых
-    # метрик (DAU/WAU/MAU, retention, воронка онбординга, paywall) в
+    # Час (по МОСКОВСКОМУ времени) ежесуточного дайджеста продуктовых метрик в
     # TEAM_CHAT_ID — см. team_bot/main.py metrics_loop. Не шлётся, если
     # team_chat_id не задан, или если ADMIN_USERNAME/ADMIN_PASSWORD не заданы
     # (честно логирует причину вместо падения).
-    metrics_hour: int = field(default_factory=lambda: int(_optional("TEAM_METRICS_HOUR", "21")))
+    #
+    # По умолчанию 0 (полночь), а не вечер: пуши пользователям уходят вечером
+    # (21:00 и 21:30 по дефолту, час настраивается пользователем и у части людей
+    # позже), и вечерний отчёт не видел вызванную ими активность. Отчёт всегда
+    # про уже ЗАКОНЧИВШИЕСЯ сутки — в полночь «сегодня» это новые сутки с нулём
+    # событий, см. last_complete_day() в shared/metrics_digest.py.
+    metrics_hour: int = field(default_factory=lambda: int(_optional("TEAM_METRICS_HOUR", "0")))
     # Basic-auth в защищённую админку бэкенда (/admin/dashboard.json,
     # /admin/persons.json) — см. shared/metrics_digest.py. Пусто → дайджест
     # метрик отключён (не пытается запрашивать без кредов).

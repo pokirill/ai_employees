@@ -27,7 +27,13 @@ from shared.docs_context import load_project_context, sync_docs_repos, topic_con
 from shared.icloud_reminders import ICloudReminders
 from shared.icloud_reminders import TaskNotFound as ReminderTaskNotFound
 from shared.llm_client import LLMClient
-from shared.metrics_digest import MetricsFetchError, build_metrics_digest, fetch_metrics
+from shared.metrics_digest import (
+    MetricsFetchError,
+    build_glossary,
+    build_metrics_digest,
+    fetch_metrics,
+    last_complete_day,
+)
 from team_bot.custdev import CustDevSession, build_summary, continue_interview, start_interview
 from team_bot.news_digest import build_news_digest
 from shared.rate_limiter import SlidingWindowLimiter
@@ -313,7 +319,8 @@ async def cmd_help(message: Message, command: CommandObject) -> None:
         "/board — открыть доску задач (мини-апп: карточка, комментарии, статус) — в личке\n"
         "/remindnow — прислать дайджест открытых задач сейчас (обычно раз в день сам)\n"
         f"/sprintnow — превью итогов спринта за текущий период (сам — по субботам в {config.sprint_hour}:00)\n"
-        f"/metricsnow — дайджест продуктовых метрик сейчас (сам — каждый вечер в {config.metrics_hour}:00)\n"
+        f"/metricsnow — метрики за текущие (неполные) сутки сейчас; сам приходит за завершившиеся сутки в {config.metrics_hour:02d}:00 МСК\n"
+        "/terms — что значат слова в отчёте по метрикам (подписка, DAU, retention и пр.)\n"
         f"/newsnow — дайджест новостей из фин-каналов сейчас (сам — по субботам в {config.news_digest_hour}:00)\n"
         "/custdev &lt;username&gt; — попросить бота написать человеку в личку и провести custdev-интервью "
         "(если он ещё не открывал бота — пришлю ссылку для пересылки, интервью начнётся само по клику; только для админов)\n"
@@ -747,7 +754,9 @@ async def sprint_loop() -> None:
             logger.exception("Sprint loop iteration failed")
 
 
-async def _build_metrics_digest_or_error() -> str:
+async def _build_metrics_digest_or_error(*, partial_day: bool = False) -> str:
+    """`partial_day=True` — ручной вызов посреди суток: числа неполные, и это
+    пишется в заголовке. Ночной запуск отчитывается за уже закончившиеся сутки."""
     if not (config.admin_username and config.admin_password):
         return "Дайджест метрик не настроен: не заданы ADMIN_USERNAME/ADMIN_PASSWORD."
     try:
@@ -755,14 +764,28 @@ async def _build_metrics_digest_or_error() -> str:
     except MetricsFetchError as exc:
         logger.exception("Metrics fetch failed")
         return f"Не удалось получить метрики: {exc}"
-    return build_metrics_digest(dashboard, persons)
+    report_date = datetime.now(_MOSCOW_TZ).date() if partial_day else last_complete_day()
+    return build_metrics_digest(
+        dashboard, persons, report_date=report_date, partial_day=partial_day
+    )
 
 
 @dp.message(Command("metricsnow"))
 async def cmd_metrics_now(message: Message) -> None:
-    # Ручной триггер того же дайджеста, что шлёт metrics_loop раз в день —
-    # чтобы проверить формат, не дожидаясь TEAM_METRICS_HOUR.
-    await message.answer(await _build_metrics_digest_or_error())
+    # Ручной триггер того же дайджеста, что шлёт metrics_loop раз в сутки.
+    # partial_day=True: сутки ещё идут, числа промежуточные — заголовок это скажет,
+    # иначе неполный день читается как итог и выглядит как просадка метрик.
+    await message.answer(await _build_metrics_digest_or_error(partial_day=True))
+
+
+@dp.message(Command("terms", "термины"))
+async def cmd_terms(message: Message) -> None:
+    # Расшифровки терминов из дайджеста метрик. Заведено после вопроса
+    # основателя «Что же такое пейвол?» — если слово в отчёте требует
+    # расшифровки, она должна быть в одном тапе, а не в чужой голове.
+    # Отдельно объясняет, почему «заходили в приложение» и «активные за 24ч»
+    # в админке не совпадают: это разные измерения, а не ошибка расчёта.
+    await message.answer(build_glossary())
 
 
 def _seconds_until_next_metrics() -> float:
@@ -774,9 +797,14 @@ def _seconds_until_next_metrics() -> float:
 
 
 async def metrics_loop() -> None:
-    # Раз в сутки, в config.metrics_hour ("вечером") по местному времени
-    # машины — дайджест продуктовых метрик (DAU/WAU/MAU, retention, воронка,
-    # paywall) с /admin/dashboard.json + /admin/persons.json в TEAM_CHAT_ID.
+    # Раз в сутки, в config.metrics_hour по МОСКОВСКОМУ времени (по умолчанию
+    # 00:00) — дайджест продуктовых метрик с /admin/dashboard.json +
+    # /admin/persons.json в TEAM_CHAT_ID.
+    #
+    # Полночь, а не вечер: пуши пользователям уходят вечером (21:00/21:30 по
+    # дефолту, час настраивается пользователем и у части людей позже), и вечерний
+    # отчёт не видел вызванную ими активность. Отчёт за уже ЗАКОНЧИВШИЕСЯ сутки —
+    # см. last_complete_day(): в 00:00 «сегодня» это новые сутки с нулём событий.
     # Та же простая sleep-петля, что reminder_loop/sprint_loop — не критичная
     # нотификация, персистентность пропуска при рестарте не нужна.
     while True:
