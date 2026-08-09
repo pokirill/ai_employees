@@ -47,7 +47,7 @@ from shared.transcription_client import MeetingTranscript, TranscriptionClient
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("team_bot")
 
-# TEAM_REMINDER_HOUR/TEAM_SPRINT_HOUR/TEAM_METRICS_HOUR/TEAM_NEWS_DIGEST_HOUR —
+# TEAM_REMINDER_HOUR/TEAM_SPRINT_HOUR/TEAM_METRICS_HOUR_MSK/TEAM_NEWS_DIGEST_HOUR —
 # часы в московском времени (10:00/19:00/21:00/09:00). Сервер живёт в UTC, а
 # старый код планировал через наивный datetime.now() = время машины = UTC, не
 # Москва. Из-за этого метрики стреляли в 21:00 UTC = 00:00 МСК — в первую
@@ -1506,7 +1506,19 @@ async def main() -> None:
     else:
         logger.info("TEAM_CHAT_ID не задан — ежедневный дайджест, итоги спринта, метрики и новостной дайджест отключены (доступны вручную через /remindnow, /sprintnow, /metricsnow, /newsnow)")
     if not (config.admin_username and config.admin_password):
-        logger.info("ADMIN_USERNAME/ADMIN_PASSWORD не заданы — ежевечерний дайджест метрик будет отвечать честной ошибкой вместо данных")
+        logger.info("ADMIN_USERNAME/ADMIN_PASSWORD не заданы — дайджест метрик будет отвечать честной ошибкой вместо данных")
+    # Явно печатаем ЭФФЕКТИВНОЕ расписание: когда сводка снова приходит «не в то
+    # время», первая же строка лога отвечает почему, без раскопок в .env.
+    logger.info("Дайджест метрик: %02d:00 МСК, за уже закончившиеся сутки", config.metrics_hour)
+    if config.legacy_metrics_hour_env:
+        logger.warning(
+            "В окружении осталась переменная TEAM_METRICS_HOUR=%s — она БОЛЬШЕ НЕ "
+            "ИСПОЛЬЗУЕТСЯ (переименована в TEAM_METRICS_HOUR_MSK, когда дайджест "
+            "перевели на полночь и на отчёт за завершившиеся сутки). Значение "
+            "игнорируется; действует %02d:00 МСК. Старую строку можно удалить из .env.",
+            config.legacy_metrics_hour_env,
+            config.metrics_hour,
+        )
     await dp.start_polling(bot)
 
 
