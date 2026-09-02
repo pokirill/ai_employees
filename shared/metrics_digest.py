@@ -16,8 +16,19 @@ class MetricsFetchError(Exception):
     """Не удалось получить данные с /admin — сеть, 401, таймаут и т.п."""
 
 
+# 🚨 Таймаут был 15 секунд, и этого перестало хватать (проверено на живом проде
+# 02.09.2026): `/admin/persons.json` отвечает 573 КБ за ~19 секунд и растёт вместе
+# с базой. Дайджест падал на нём КАЖДЫЙ раз, а ошибка уходила в лог внутри
+# `except` в цикле напоминаний — снаружи это выглядело как «бот молчит».
+#
+# 60 секунд — с запасом к нынешним девятнадцати. Правильное решение другое:
+# пагинация или лёгкий агрегат на стороне бэкенда вместо выгрузки всех людей
+# целиком. Пока его нет, таймаут не должен быть тем, что рвёт отчёт.
+_SLOW_ENDPOINT_TIMEOUT = 60.0
+
+
 async def _fetch_json(client: httpx.AsyncClient, base_url: str, path: str, auth: tuple[str, str]) -> dict:
-    resp = await client.get(f"{base_url}{path}", auth=auth, timeout=15.0)
+    resp = await client.get(f"{base_url}{path}", auth=auth, timeout=_SLOW_ENDPOINT_TIMEOUT)
     resp.raise_for_status()
     return resp.json()
 
@@ -32,12 +43,31 @@ async def fetch_metrics(base_url: str, username: str, password: str) -> tuple[di
     auth = (username, password)
     try:
         async with httpx.AsyncClient() as client:
-            dashboard = await _fetch_json(client, base_url, "/admin/dashboard.json", auth)
+            # 🚨 Сначала `/admin/product.json` — продуктовые метрики (активность,
+            # retention, воронка пейволла). `/admin/dashboard.json` когда-то отдавал
+            # именно их, но сменил смысл на операционную сводку (`mart`, `traffic`,
+            # `errors`), и дайджест с тех пор молча выходил с прочерками: ключи
+            # `product` и `data_quality` в ответе просто исчезли, а код читает их
+            # через `.get` и не падает. Найдено 02.09.2026.
+            #
+            # Фолбэк на старый адрес оставлен на время, пока бэкенд не выкачен:
+            # 404 здесь значит «сервер старее бота», а не поломку.
+            try:
+                dashboard = await _fetch_json(client, base_url, "/admin/product.json", auth)
+            except httpx.HTTPStatusError as exc:
+                if exc.response.status_code != 404:
+                    raise
+                logger.warning("Нет /admin/product.json — беру старый /admin/dashboard.json")
+                dashboard = await _fetch_json(client, base_url, "/admin/dashboard.json", auth)
             persons = await _fetch_json(client, base_url, "/admin/persons.json", auth)
     except httpx.HTTPStatusError as exc:
         raise MetricsFetchError(f"Админка ответила {exc.response.status_code} — проверь ADMIN_USERNAME/ADMIN_PASSWORD") from exc
     except httpx.HTTPError as exc:
-        raise MetricsFetchError(f"Не достучался до {base_url} — {exc}") from exc
+        # `httpx.ReadTimeout` печатается пустой строкой, и сообщение получалось
+        # «Не достучался до … —» без причины. Подставляем тип, иначе разбор
+        # начинается с гадания, что именно случилось.
+        reason = str(exc) or type(exc).__name__
+        raise MetricsFetchError(f"Не достучался до {base_url} — {reason}") from exc
     return dashboard, persons
 
 
