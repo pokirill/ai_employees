@@ -116,6 +116,22 @@ def render_personal(result: PersonResult, sprint: Sprint) -> str:
     return "\n".join(lines)
 
 
+def _plural(count: int, one: str, few: str, many: str) -> str:
+    """«1 задача», «2 задачи», «5 задач».
+
+    Мелочь, но сводка приходит каждому человеку раз в две недели, и «1 задач»
+    в ней читается как небрежность — а вместе с ней обесценивается и остальное.
+    """
+    if 11 <= count % 100 <= 14:
+        return many
+    last = count % 10
+    if last == 1:
+        return one
+    if 2 <= last <= 4:
+        return few
+    return many
+
+
 def _verdict(result: PersonResult) -> str:
     """Одна фраза в конце. Только на основании чисел, без домыслов."""
     rate = result.completion_rate or 0
@@ -125,9 +141,15 @@ def _verdict(result: PersonResult) -> str:
     if left == 0 and done > 0:
         return f"Весь план закрыт — {done} из {done}. Это редко у кого получается два спринта подряд."
     if rate >= 80:
-        return f"Почти всё: {done} из {result.planned}. Осталось {left} — перенёс в следующий спринт."
+        tail = _plural(left, "задача", "задачи", "задач")
+        return f"Почти всё: {done} из {result.planned}. Осталась {left} {tail} — перенёс в следующий спринт."
     if rate >= 50:
-        return f"Больше половины плана закрыто. {left} задач переезжает — посмотри, не пора ли их разбить помельче."
+        tail = _plural(left, "задача", "задачи", "задач")
+        verb = "переезжает" if left % 10 == 1 and left % 100 != 11 else "переезжают"
+        return (
+            f"Больше половины плана закрыто. {left} {tail} {verb} — "
+            "посмотри, не пора ли их разбить помельче."
+        )
     if done == 0:
         return (
             "Ни одна задача не закрыта. Если они оказались крупнее, чем выглядели, "

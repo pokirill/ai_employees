@@ -5,10 +5,16 @@ from html import escape
 from shared.task_store import Task
 
 
-def build_reminder_digest(tasks: list[Task]) -> str | None:
+def build_reminder_digest(tasks: list[Task], *, backlog_count: int = 0) -> str | None:
     """Ежедневный дайджест открытых задач для чата команды (HTML parse_mode).
     None, если открытых задач нет вообще — не шлём "всё сделано" ради самого
-    себя, дайджест нужен только когда есть о чём напомнить."""
+    себя, дайджест нужен только когда есть о чём напомнить.
+
+    `backlog_count` — сколько задач лежит в бэклоге. Нужен, чтобы у тех, кто
+    закрыл свой план, был очевидный следующий шаг: без этой строки человек либо
+    сам догадается написать /more, либо просто останется без задач до
+    следующего спринта. Второе случается чаще.
+    """
     pending = [t for t in tasks if t.status != "done"]
     if not pending:
         return None
@@ -33,6 +39,11 @@ def build_reminder_digest(tasks: list[Task]) -> str | None:
     if unclaimed:
         lines.append("\nПока никто не взял:")
         lines.extend(f"• «{escape(t.title)}»" for t in unclaimed)
+
+    if backlog_count:
+        lines.append(
+            f"\nЗакрыл своё? В бэклоге ещё {backlog_count} — напиши /more, предложу три самых важных."
+        )
 
     return "\n".join(lines)
 

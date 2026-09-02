@@ -25,6 +25,7 @@ from shared.config import LLMConfig, TaskBoardConfig, TeamBotConfig
 from shared.context_heuristic import question_needs_project_context
 from shared.docs_context import load_project_context, sync_docs_repos, topic_context_files
 from shared.icloud_reminders import ICloudReminders
+from shared import epics
 from shared.sprints import SprintStore
 from shared.sync_engine import SyncState
 from team_bot.sprint_flow import SYNC_INTERVAL_SECONDS as SPRINT_SYNC_INTERVAL
@@ -334,6 +335,15 @@ async def cmd_help(message: Message, command: CommandObject) -> None:
         "/custdev &lt;username&gt; — попросить бота написать человеку в личку и провести custdev-интервью "
         "(если он ещё не открывал бота — пришлю ссылку для пересылки, интервью начнётся само по клику; только для админов)\n"
         "/enddev &lt;username&gt; — остановить активное интервью и прислать сводку (только для админов)\n\n"
+        "<b>Спринт и планирование</b>\n"
+        "/sprint — текущий спринт: цель, сколько закрыто, кто как загружен\n"
+        "/capacity — сказать, насколько я занят (кнопками или числом часов)\n"
+        "/plan — предложить, как разложить бэклог по людям\n"
+        "/more — закончились задачи, дай ещё\n"
+        "/backlog — что ещё не взято в спринт, по эпикам\n"
+        "/epic &lt;номер&gt; &lt;код&gt;, /prio &lt;номер&gt; &lt;0-3&gt;, /est &lt;номер&gt; &lt;часы&gt; — эпик, приоритет, оценка\n"
+        "/startsprint [цель] — закрыть текущий спринт и открыть новый на две недели\n"
+        "/miro &lt;ссылка&gt; — привязать канбан-доску Miro, /syncnow — синхронизировать сейчас\n\n"
         "<b>Ассистент</b>\n"
         "/ask &lt;вопрос&gt; — спросить про проект (контекст из Docs/ обоих репо + плейбук Авито)\n"
         "В группе: упомяни меня (@бот вопрос) или ответь на моё сообщение\n"
@@ -366,7 +376,12 @@ async def cmd_task(message: Message, command: CommandObject) -> None:
         )
         return
     author = message.from_user.full_name if message.from_user else "неизвестно"
-    task = tasks_store.add_task(title, created_by=author)
+    # TASK-SYS-1: эпик ставим сразу при создании. Иначе половина доски будет
+    # «не разобрано», и группировка, ради которой эпики заводили, не заработает:
+    # никто не пойдёт расставлять их руками задним числом.
+    task = tasks_store.add_task(
+        title, created_by=author, epic=epics.classify(title, llm=llm), origin="bot"
+    )
     try:
         uid = reminders.add_task(title, notes=f"От {author} в Telegram, доска #{task.id}")
         tasks_store.set_reminder_uid(task.id, uid)
@@ -617,7 +632,10 @@ async def cmd_board(message: Message) -> None:
 async def cmd_remind_now(message: Message) -> None:
     # Ручной триггер того же дайджеста, что шлёт reminder_loop раз в день —
     # чтобы проверить формат/содержание, не дожидаясь TEAM_REMINDER_HOUR.
-    digest = build_reminder_digest(tasks_store.list_tasks(include_done=False))
+    digest = build_reminder_digest(
+        tasks_store.list_tasks(include_done=False),
+        backlog_count=len(tasks_store.list_backlog()),
+    )
     await message.answer(digest or "Открытых задач нет — напоминать не о чем 🎉")
 
 
@@ -637,7 +655,10 @@ async def reminder_loop() -> None:
     while True:
         try:
             await asyncio.sleep(_seconds_until_next_reminder())
-            digest = build_reminder_digest(tasks_store.list_tasks(include_done=False))
+            digest = build_reminder_digest(
+        tasks_store.list_tasks(include_done=False),
+        backlog_count=len(tasks_store.list_backlog()),
+    )
             if digest:
                 await bot.send_message(config.team_chat_id, digest)
         except Exception:
@@ -1272,7 +1293,9 @@ def _create_task_from_meeting(title: str) -> None:
     best-effort зеркало) — см. cmd_task выше. created_by="встреча" — чтобы на
     доске было видно, что задача пришла из автоматического резюме, а не
     вручную от конкретного человека."""
-    task = tasks_store.add_task(title, created_by="встреча")
+    task = tasks_store.add_task(
+        title, created_by="встреча", epic=epics.classify(title, llm=llm), origin="встреча"
+    )
     try:
         uid = reminders.add_task(title, notes=f"Из резюме встречи, доска #{task.id}")
         tasks_store.set_reminder_uid(task.id, uid)

@@ -343,6 +343,22 @@ def register(dp: Dispatcher, flow: SprintFlow) -> None:
         )
         await callback.answer(f"Записал: {capacity.level_title}")
 
+        # Дописываем в то же сообщение, кто уже ответил. Живой список вместо
+        # десятка отдельных «записал» в чате: видно, кого ещё ждём, и никто не
+        # спрашивает «все сказали?».
+        declared = flow.sprints.capacities(sprint.id)
+        summary = ", ".join(f"{c.person} — {c.level_title}" for c in declared)
+        try:
+            await callback.message.edit_text(
+                f"{_strip_declared(callback.message.html_text)}\n\n"
+                f"<b>Уже сказали:</b> {escape(summary)}",
+                reply_markup=_capacity_keyboard(),
+            )
+        except Exception:  # noqa: BLE001
+            # Сообщение могли удалить или оно слишком старое для правки —
+            # это не повод ронять обработчик, заявка уже записана.
+            logger.debug("Не смог обновить сообщение о загрузке")
+
     @dp.message(Command("plan"))
     async def cmd_plan(message: Message) -> None:
         sprint = flow.sprints.current()
@@ -476,6 +492,13 @@ def register(dp: Dispatcher, flow: SprintFlow) -> None:
 # ----------------------------------------------------------------------
 # Мелочи
 # ----------------------------------------------------------------------
+
+
+def _strip_declared(text: str) -> str:
+    """Убирает прошлый список ответивших, чтобы он не копился при каждом нажатии."""
+    marker = "\n\nУже сказали:"
+    index = text.find(marker)
+    return text[:index] if index > 0 else text
 
 
 def _person(source) -> str:
