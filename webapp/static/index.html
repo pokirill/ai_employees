@@ -227,6 +227,12 @@
     background: var(--claimed-soft);
     color: var(--claimed);
   }
+  /* TASK-SYS-1: эпик и приоритет в списке. */
+  .chip-epic { background: rgba(255,255,255,.06); padding-inline: 6px; }
+  .chip-prio[data-level="0"] { background: rgba(255, 96, 96, .16); color: #ff9c9c; }
+  .chip-prio[data-level="1"] { background: rgba(255, 196, 96, .14); color: #ffcf8f; }
+  .sprint-bar b { font-family: var(--font-display); }
+
   .status-pill {
     display: inline-flex;
     align-items: center;
@@ -663,6 +669,24 @@ function renderTask(task) {
 
   const meta = document.createElement("div");
   meta.className = "task-meta";
+  // Эпик и приоритет — первыми: по ним глаз ищет задачу в длинном списке,
+  // а «кто создал и когда» интересует уже после того, как она найдена.
+  if (task.epic_emoji) {
+    const epic = document.createElement("span");
+    epic.className = "chip chip-epic";
+    epic.textContent = task.epic_emoji;
+    epic.title = task.epic_label || "";
+    meta.appendChild(epic);
+  }
+  if (typeof task.priority === "number" && task.priority <= 1) {
+    // Только высокие приоритеты. Значок на каждой второй карточке перестаёт
+    // что-либо значить, а P2 — это и есть «обычная задача».
+    const prio = document.createElement("span");
+    prio.className = "chip chip-prio";
+    prio.dataset.level = String(task.priority);
+    prio.textContent = task.priority === 0 ? "🔥 сначала" : "важно";
+    meta.appendChild(prio);
+  }
   const metaText = document.createElement("span");
   metaText.textContent = `${task.created_by} · ${fmtTime(task.created_at)}`;
   meta.appendChild(metaText);
@@ -710,11 +734,23 @@ async function loadSprint() {
   // Тихо игнорируем ошибки — баннер спринта необязателен для работы доски.
   try {
     const sprint = await api("/api/sprint", {});
-    document.getElementById("sprint-banner").innerHTML =
-      `📊 Спринт <b>${sprint.period_label}</b>: ` +
-      `✅ <b>${sprint.done_count}</b> сделали · ` +
-      `❌ <b>${sprint.cancelled_count}</b> отменили · ` +
-      `➡️ <b>${sprint.still_open_count}</b> перенесли`;
+    const banner = document.getElementById("sprint-banner");
+    if (sprint.sprint_active) {
+      // Открыт настоящий спринт — показываем его: сколько закрыто из взятого и
+      // сколько дней осталось. Это то, на что смотрят каждый день, в отличие
+      // от статистики за скользящую неделю.
+      const goal = sprint.sprint_goal ? ` · ${sprint.sprint_goal}` : "";
+      banner.innerHTML =
+        `🎯 <b>${sprint.sprint_period}</b>${goal} — ` +
+        `<b>${sprint.sprint_done}</b> из <b>${sprint.sprint_total}</b>, ` +
+        `осталось дней: <b>${sprint.sprint_days_left}</b>`;
+    } else {
+      banner.innerHTML =
+        `📊 Спринт <b>${sprint.period_label}</b>: ` +
+        `✅ <b>${sprint.done_count}</b> сделали · ` +
+        `❌ <b>${sprint.cancelled_count}</b> отменили · ` +
+        `➡️ <b>${sprint.still_open_count}</b> перенесли`;
+    }
   } catch {
     /* баннер спринта необязателен — тихо пропускаем */
   }

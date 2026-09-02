@@ -10,6 +10,8 @@ from pydantic import BaseModel
 
 from shared.config import TaskBoardConfig
 from shared.sprint_state import current_sprint_period
+from shared import epics
+from shared.sprints import SprintStore
 from shared.task_store import Task, TaskNotFound, TaskStore
 from shared.telegram_webapp_auth import InvalidInitData, validate_init_data
 
@@ -23,6 +25,7 @@ _bot_token = os.getenv("TEAM_BOT_TOKEN")
 if not _bot_token:
     raise RuntimeError("Missing required env var: TEAM_BOT_TOKEN (нужен для проверки initData мини-аппа)")
 _store = TaskStore(_board_config.db_path)
+_sprints = SprintStore(_board_config.db_path)
 
 app = FastAPI(title="Кубышка — доска задач")
 app.mount("/static", StaticFiles(directory=_STATIC_DIR), name="static")
@@ -97,6 +100,15 @@ def _task_to_dict(task: Task) -> dict:
         "created_at": task.created_at,
         "completed_at": task.completed_at,
         "cancelled_at": task.cancelled_at,
+        # TASK-SYS-1: планирование. Мини-апп должен показывать то же, что видно
+        # в боте и на доске Miro, иначе три инструмента будут выглядеть тремя
+        # разными системами, а это ровно то, от чего уходили.
+        "epic": task.epic,
+        "epic_label": epics.label(task.epic),
+        "epic_emoji": epics.get(task.epic).emoji,
+        "priority": task.priority,
+        "sprint_id": task.sprint_id,
+        "estimate_hours": task.estimate_hours,
         "comments": [{"author": c.author, "text": c.text, "created_at": c.created_at} for c in task.comments],
         "photos": [
             {
@@ -187,12 +199,34 @@ def sprint_status(payload: InitDataPayload) -> dict:
     # открытие доски не должно "закрывать" спринт как побочный эффект.
     _authenticated_user(payload.init_data)
     since, now = current_sprint_period(_board_config.sprint_state_path)
-    return {
+    payload_out = {
         "period_label": f"{since:%d.%m}–{now:%d.%m}",
         "done_count": len(_store.list_done_since(since)),
         "cancelled_count": len(_store.list_cancelled_since(since)),
         "still_open_count": len(_store.list_tasks(include_done=False)),
     }
+
+    # TASK-SYS-1: если открыт настоящий спринт (сущность, а не скользящее окно),
+    # добавляем его поля. Старые ключи оставляем нетронутыми: этой ручкой уже
+    # пользуется баннер в мини-аппе, и ломать его ради новых полей незачем.
+    sprint = _sprints.current()
+    if sprint is not None:
+        sprint_tasks = _store.list_by_sprint(sprint.id)
+        payload_out.update(
+            {
+                "sprint_active": True,
+                "sprint_id": sprint.id,
+                "sprint_title": sprint.title,
+                "sprint_goal": sprint.goal,
+                "sprint_period": sprint.period_label,
+                "sprint_days_left": sprint.days_left(),
+                "sprint_total": len(sprint_tasks),
+                "sprint_done": len([t for t in sprint_tasks if t.status == "done"]),
+            }
+        )
+    else:
+        payload_out["sprint_active"] = False
+    return payload_out
 
 
 @app.post("/api/tasks/{task_id}/comment")

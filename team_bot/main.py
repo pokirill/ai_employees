@@ -25,6 +25,11 @@ from shared.config import LLMConfig, TaskBoardConfig, TeamBotConfig
 from shared.context_heuristic import question_needs_project_context
 from shared.docs_context import load_project_context, sync_docs_repos, topic_context_files
 from shared.icloud_reminders import ICloudReminders
+from shared.sprints import SprintStore
+from shared.sync_engine import SyncState
+from team_bot.sprint_flow import SYNC_INTERVAL_SECONDS as SPRINT_SYNC_INTERVAL
+from team_bot.sprint_flow import SprintFlow
+from team_bot.sprint_flow import register as register_sprint_flow
 from shared.icloud_reminders import TaskNotFound as ReminderTaskNotFound
 from shared.llm_client import LLMClient
 from shared.metrics_digest import (
@@ -67,6 +72,10 @@ reminders = ICloudReminders(
 # Доска задач (мини-апп) — источник правды для claim/статус/комментариев,
 # Напоминания остаются best-effort зеркалом (см. cmd_task/cmd_done).
 tasks_store = TaskStore(board_config.db_path)
+# TASK-SYS-1: спринты, ёмкость и снимки синхронизации — в том же файле БД,
+# чтобы «задачи спринта» собирались одним запросом, а не склейкой в Python.
+sprint_store = SprintStore(board_config.db_path)
+sync_state = SyncState(board_config.db_path)
 
 # Фото, прикреплённые к задачам (см. cmd_photo/_save_task_photo) — лежат под
 # webapp/static по умолчанию, чтобы webapp/server.py отдавал их без отдельного
@@ -1487,6 +1496,12 @@ _BOT_COMMANDS = [
     BotCommand(command="ask", description="Спросить ассистента про проект"),
     BotCommand(command="id", description="ID текущего чата"),
     BotCommand(command="help", description="Список команд"),
+    BotCommand(command="sprint", description="Текущий спринт и загрузка команды"),
+    BotCommand(command="plan", description="Предложить, как разложить задачи"),
+    BotCommand(command="capacity", description="Сказать, насколько я занят"),
+    BotCommand(command="more", description="Дай ещё задач"),
+    BotCommand(command="backlog", description="Что не взято в спринт"),
+    BotCommand(command="miro", description="Доска Miro: привязать или открыть"),
 ]
 
 
@@ -1498,6 +1513,31 @@ async def main() -> None:
     logger.info("Bot username resolved: @%s", _bot_username)
     # Без этого Telegram не показывает автодополнение команд при вводе "/".
     await bot.set_my_commands(_BOT_COMMANDS)
+    # TASK-SYS-1: сценарии спринта, синхронизация с Miro и Напоминаниями.
+    # Регистрируем ДО start_polling, иначе хендлеры не увидят первых сообщений.
+    flow = SprintFlow(
+        bot=bot,
+        tasks=tasks_store,
+        sprints=sprint_store,
+        sync_state=sync_state,
+        team_chat_id=config.team_chat_id,
+        miro_token=board_config.miro_token,
+        miro_board_id=board_config.miro_board_id,
+        # Напоминания создаём лениво: без ключей iCloud объект бесполезен, а
+        # падать из-за этого при старте бота нельзя.
+        reminders_factory=(lambda: reminders) if config.icloud_apple_id else None,
+        llm=llm,
+        webapp_url=board_config.webapp_url,
+    )
+    register_sprint_flow(dp, flow)
+    asyncio.create_task(flow.sync_loop())
+    asyncio.create_task(flow.lifecycle_loop())
+    logger.info(
+        "Спринты: синхронизация каждые %d с, Miro %s",
+        SPRINT_SYNC_INTERVAL,
+        "подключён" if board_config.miro_token and board_config.miro_board_id else "не настроен",
+    )
+
     if config.team_chat_id:
         asyncio.create_task(reminder_loop())
         asyncio.create_task(sprint_loop())

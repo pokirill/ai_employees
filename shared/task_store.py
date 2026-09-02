@@ -46,6 +46,28 @@ class Task:
     # спринт-дайджеста (shared/sprint_digest.py), симметрично completed_at.
     cancelled_at: str | None = None
 
+    # --- Планирование (TASK-SYS-1) ---
+    # Эпик из закрытого списка shared/epics.py. Пусто = «не разобрано»:
+    # это нормальный исход классификации, а не ошибка.
+    epic: str | None = None
+    # 0 — сначала, 3 — когда дойдут руки. Числом, а не словом: словами
+    # «важно/очень важно/критично» команда за месяц перестаёт различать.
+    priority: int = 2
+    # Спринт, в который задача взята. None = в бэклоге.
+    sprint_id: int | None = None
+    # Грубая оценка в часах. Нужна не для отчётности, а чтобы предложение
+    # распределения не сваливало на человека двадцать задач разом.
+    estimate_hours: float | None = None
+
+    # --- Синхронизация (TASK-SYS-1) ---
+    # Когда задачу трогали в последний раз. Основа разрешения конфликтов:
+    # без этого поля нельзя понять, чья правка свежее.
+    updated_at: str | None = None
+    # Откуда задача пришла: bot | miro | reminders | import | встреча.
+    origin: str | None = None
+    # Идентификатор карточки в Miro. None — карточки ещё нет.
+    miro_item_id: str | None = None
+
 
 class TaskNotFound(RuntimeError):
     pass
@@ -81,6 +103,14 @@ class TaskStore:
         "claimed_by_user_id": "INTEGER",
         "description": "TEXT",
         "cancelled_at": "TEXT",
+        # TASK-SYS-1: планирование и синхронизация с Miro/Напоминаниями.
+        "epic": "TEXT",
+        "priority": "INTEGER NOT NULL DEFAULT 2",
+        "sprint_id": "INTEGER",
+        "estimate_hours": "REAL",
+        "updated_at": "TEXT",
+        "origin": "TEXT",
+        "miro_item_id": "TEXT",
     }
 
     def _init_schema(self) -> None:
@@ -129,14 +159,86 @@ class TaskStore:
                 """
             )
 
-    def add_task(self, title: str, created_by: str, description: str = "") -> Task:
+    def add_task(
+        self,
+        title: str,
+        created_by: str,
+        description: str = "",
+        *,
+        epic: str | None = None,
+        priority: int = 2,
+        origin: str | None = None,
+        estimate_hours: float | None = None,
+    ) -> Task:
+        now = _now()
         with self._connect() as conn:
             cursor = conn.execute(
-                "INSERT INTO tasks (title, status, created_by, created_at, description) VALUES (?, 'open', ?, ?, ?)",
-                (title, created_by, _now(), description or None),
+                "INSERT INTO tasks (title, status, created_by, created_at, description,"
+                " epic, priority, origin, estimate_hours, updated_at)"
+                " VALUES (?, 'open', ?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    title, created_by, now, description or None,
+                    epic, priority, origin, estimate_hours, now,
+                ),
             )
             task_id = cursor.lastrowid
         return self.get_task(task_id)
+
+    # --- Планирование (TASK-SYS-1) ---
+
+    def set_epic(self, task_id: int, epic: str | None) -> Task:
+        return self._update_or_raise(task_id, "UPDATE tasks SET epic = ? WHERE id = ?", (epic, task_id))
+
+    def set_priority(self, task_id: int, priority: int) -> Task:
+        # Диапазон режем здесь, а не у вызывающего: приоритет приходит и из
+        # чата, и из Miro, и из импорта — проверять в трёх местах бессмысленно.
+        priority = max(0, min(3, int(priority)))
+        return self._update_or_raise(
+            task_id, "UPDATE tasks SET priority = ? WHERE id = ?", (priority, task_id)
+        )
+
+    def set_sprint(self, task_id: int, sprint_id: int | None) -> Task:
+        return self._update_or_raise(
+            task_id, "UPDATE tasks SET sprint_id = ? WHERE id = ?", (sprint_id, task_id)
+        )
+
+    def set_estimate(self, task_id: int, hours: float | None) -> Task:
+        return self._update_or_raise(
+            task_id, "UPDATE tasks SET estimate_hours = ? WHERE id = ?", (hours, task_id)
+        )
+
+    def set_miro_item_id(self, task_id: int, item_id: str | None) -> Task:
+        return self._update_or_raise(
+            task_id, "UPDATE tasks SET miro_item_id = ? WHERE id = ?", (item_id, task_id)
+        )
+
+    def list_by_sprint(self, sprint_id: int) -> list[Task]:
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT * FROM tasks WHERE sprint_id = ? AND status != 'cancelled'"
+                " ORDER BY priority, (status = 'done'), created_at",
+                (sprint_id,),
+            ).fetchall()
+            return [self._hydrate(conn, row) for row in rows]
+
+    def list_backlog(self) -> list[Task]:
+        """Что не взято ни в один спринт и ещё не сделано — из этого набирают."""
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT * FROM tasks WHERE sprint_id IS NULL AND status = 'open'"
+                " ORDER BY priority, created_at"
+            ).fetchall()
+            return [self._hydrate(conn, row) for row in rows]
+
+    def find_by_miro_item(self, item_id: str) -> Task | None:
+        with self._connect() as conn:
+            row = conn.execute("SELECT * FROM tasks WHERE miro_item_id = ?", (item_id,)).fetchone()
+            return self._hydrate(conn, row) if row else None
+
+    def find_by_reminder_uid(self, uid: str) -> Task | None:
+        with self._connect() as conn:
+            row = conn.execute("SELECT * FROM tasks WHERE reminder_uid = ?", (uid,)).fetchone()
+            return self._hydrate(conn, row) if row else None
 
     def list_tasks(self, *, include_done: bool = True, done_within_days: int | None = None) -> list[Task]:
         """done_within_days: если задан (и include_done=True), задачи со
@@ -273,7 +375,25 @@ class TaskStore:
             result = conn.execute(sql, params)
             if result.rowcount == 0:
                 raise TaskNotFound(f"Задача #{task_id} не найдена")
+            # Отметку времени ставим ЗДЕСЬ, а не в каждом методе: через этот
+            # helper проходят все изменения задачи, и так её невозможно
+            # забыть. От неё зависит разрешение конфликтов при синхронизации
+            # с Miro и Напоминаниями — пропущенная отметка означает потерянную
+            # правку, причём молча.
+            conn.execute("UPDATE tasks SET updated_at = ? WHERE id = ?", (_now(), task_id))
         return self.get_task(task_id)
+
+    def _hydrate(self, conn: sqlite3.Connection, row: sqlite3.Row) -> Task:
+        """Строка БД в готовую задачу вместе с комментариями и фото.
+
+        Вынесено отдельно, потому что выборок стало несколько (спринт, бэклог,
+        поиск по внешнему id), и повторять три строки в каждой — верный способ
+        однажды забыть комментарии в одной из них.
+        """
+        task = _row_to_task(row)
+        task.comments = self._load_comments(conn, task.id)
+        task.photos = self._load_photos(conn, task.id)
+        return task
 
     def _load_comments(self, conn: sqlite3.Connection, task_id: int) -> list[Comment]:
         rows = conn.execute(
@@ -300,6 +420,20 @@ class TaskStore:
         ]
 
 
+def _column(row: sqlite3.Row, name: str, default=None):
+    """Значение колонки, которой может не быть в старом файле БД.
+
+    ALTER TABLE в _init_schema их добавляет, но чтение может произойти и до
+    первого запуска новой версии — например, из другого процесса (webapp),
+    который поднялся раньше. Падать на этом нельзя: доска важнее полей.
+    """
+    try:
+        value = row[name]
+    except (IndexError, KeyError):
+        return default
+    return default if value is None else value
+
+
 def _row_to_task(row: sqlite3.Row) -> Task:
     return Task(
         id=row["id"],
@@ -313,6 +447,13 @@ def _row_to_task(row: sqlite3.Row) -> Task:
         claimed_by_user_id=row["claimed_by_user_id"],
         description=row["description"],
         cancelled_at=row["cancelled_at"],
+        epic=_column(row, "epic"),
+        priority=int(_column(row, "priority", 2)),
+        sprint_id=_column(row, "sprint_id"),
+        estimate_hours=_column(row, "estimate_hours"),
+        updated_at=_column(row, "updated_at"),
+        origin=_column(row, "origin"),
+        miro_item_id=_column(row, "miro_item_id"),
     )
 
 

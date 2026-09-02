@@ -213,6 +213,18 @@ class TaskBoardConfig:
     # webapp/server.py уже монтирует StaticFiles на /static.
     photos_dir: str = field(default_factory=lambda: _optional("TASK_PHOTOS_DIR", "webapp/static/task_photos"))
 
+    # TASK-SYS-1: канбан-доска в Miro.
+    #
+    # MIRO_TOKEN — токен приложения Miro с правами boards:read и boards:write.
+    # MIRO_BOARD_ID — доска по умолчанию; у конкретного спринта может быть своя
+    # (см. shared/sprints.py), и она главнее этой.
+    #
+    # Пусто → синхронизация с Miro просто выключена. Это не деградация: доска
+    # в мини-аппе и Напоминания работают сами по себе, и команда ничего не
+    # теряет, пока Miro не подключили.
+    miro_token: str = field(default_factory=lambda: _optional("MIRO_TOKEN"))
+    miro_board_id: str = field(default_factory=lambda: _optional("MIRO_BOARD_ID"))
+
 
 @dataclass(frozen=True)
 class LLMConfig:
