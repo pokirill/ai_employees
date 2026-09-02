@@ -26,11 +26,11 @@ class OpenTask:
 class ICloudReminders:
     """Создаёт задачи в расшаренном списке Напоминаний iCloud через CalDAV.
 
-    Список («Кубышка — задачи» по умолчанию) должен быть заведён и
-    расшарен на команду ЗАРАНЕЕ вручную в приложении Напоминания на
-    телефоне владельца Apple ID — публичного API для создания самого
-    списка/шаринга не существует, только для записи задач в уже
-    существующий список.
+    Список («Кубышка — задачи» по умолчанию) создаётся заранее. Сам список
+    можно завести и по CalDAV (`principal.make_calendar` с компонентом
+    VTODO — проверено на живом iCloud 02.09.2026), а вот РАСШАРИТЬ его на
+    команду можно только вручную в приложении Напоминания: публичного API
+    для приглашений у Apple нет.
     """
 
     def __init__(self, apple_id: str, app_specific_password: str, list_name: str) -> None:
@@ -75,12 +75,36 @@ class ICloudReminders:
         todo_list.add_todo(vtodo)
         return uid
 
-    def list_open_tasks(self) -> list[OpenTask]:
-        """Незавершённые задачи списка, отсортированные как в приложении
-        (по due/priority — так же, как caldav.Calendar.todos() по умолчанию)."""
+
+    def _open_todos(self) -> list:
+        """Незавершённые задачи списка.
+
+        🚨 Не `Calendar.todos()`. Проверено на живом iCloud 02.09.2026: его
+        REPORT-запрос (фильтр по завершённости плюс сортировка по due) сервер
+        Apple отдаёт как `500 Internal Server Error` — на нашем списке он падал
+        ВСЕГДА, и синхронизация Напоминаний молча жила одной половиной: задачи
+        уезжали в список, а обратно не читались ни разу.
+
+        `search(comp_class=Todo)` строит простой запрос без фильтров — он
+        проходит. Завершённые отсеиваем на своей стороне: это дешевле, чем
+        зависеть от того, какой фильтр Apple переварит сегодня.
+        """
         todo_list = self._resolve_list()
+        items = []
+        for todo in todo_list.search(comp_class=caldav.Todo):
+            component = todo.icalendar_component
+            status = str(component.get("status", "")).upper()
+            if status in {"COMPLETED", "CANCELLED"}:
+                continue
+            if component.get("completed") is not None:
+                continue
+            items.append(todo)
+        return items
+
+    def list_open_tasks(self) -> list[OpenTask]:
+        """Незавершённые задачи списка."""
         tasks: list[OpenTask] = []
-        for todo in todo_list.todos(include_completed=False):
+        for todo in self._open_todos():
             component = todo.icalendar_component
             title = str(component.get("summary", "(без названия)"))
             uid = str(component.get("uid"))
@@ -91,8 +115,7 @@ class ICloudReminders:
         """Отмечает задачу выполненной. Возвращает её название (для ответа
         пользователю). Бросает TaskNotFound, если uid не найден среди
         незавершённых задач списка."""
-        todo_list = self._resolve_list()
-        for todo in todo_list.todos(include_completed=False):
+        for todo in self._open_todos():
             component = todo.icalendar_component
             if str(component.get("uid")) == uid:
                 title = str(component.get("summary", "(без названия)"))
